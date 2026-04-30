@@ -1,0 +1,23 @@
+{
+  "name": "fast-v1-mesh-sculptor",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "cdt2d": "^1.0.0",
+    "earcut": "^3.0.2",
+    "three": "^0.183.2",
+    "three-mesh-bvh": "^0.9.9"
+  },
+  "devDependencies": {
+    "@types/earcut": "^3.0.0",
+    "@types/three": "^0.183.1",
+    "typescript": "^6.0.2",
+    "vite": "^8.0.8"
+  }
+}

@@ -1,0 +1,5 @@
+node_modules
+dist
+.codex-logs
+.vite-dev.out.log
+.vite-dev.err.log
