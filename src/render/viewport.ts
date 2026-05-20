@@ -4,16 +4,25 @@ import {
   CanvasTexture,
   Color,
   DoubleSide,
+  GridHelper,
+  Group,
+  LinearFilter,
+  LinearMipmapLinearFilter,
   MOUSE,
+  type Material,
   Mesh,
   MeshBasicMaterial,
   MeshMatcapMaterial,
   NoToneMapping,
   PerspectiveCamera,
+  PlaneGeometry,
   Raycaster,
   Scene,
   SphereGeometry,
+  Spherical,
   SRGBColorSpace,
+  TorusGeometry,
+  type Texture,
   Vector2,
   Vector3,
   WebGLRenderer,
@@ -32,8 +41,9 @@ import {
   computeCoherentBoundaryNormals,
   extrudeBoundaryLoop,
   extrudeBoundaryLoopAlongVector,
+  extrudeBoundaryLoopToZPlane,
 } from '../ops/boundary-extrude';
-import { surfaceRemeshMesh } from '../ops/surface-remesh';
+import { surfaceRemeshMesh, weldGeometryByDistance } from '../ops/surface-remesh';
 import type { RemeshBoundaryMode } from '../ops/surface-remesh';
 import {
   laplacianSmoothSelected,
@@ -52,7 +62,7 @@ import {
   createMesh as createHoleFillMesh,
   fillHole as executeHoleFill,
 } from '../sculpt/hole-fill';
-import { buildHoleLoopSet } from '../sculpt/hole-loops';
+import { buildHoleLoopSet, buildOpenBoundaryLoopCandidates, countNonManifoldEdges } from '../sculpt/hole-loops';
 import { SculptEngine } from '../sculpt/sculpt-engine';
 import type {
   BrushType,
@@ -60,6 +70,7 @@ import type {
   HistoryState,
   HoleLoopSummary,
   InteractionMode,
+  MeasurementState,
   MeshStats,
   SculptHistorySnapshot,
   SelectionState,
@@ -80,6 +91,12 @@ interface ViewportCallbacks {
   onBoundaryAction?: (result: { success: boolean; message: string }) => void;
   onMeshStatsChange?: (stats: MeshStats) => void;
   onHoleFill?: (result: { success: boolean; message: string }) => void;
+  onViewCubeTransform?: (transform: string) => void;
+  onMeasurementChange?: (state: MeasurementState) => void;
+  onMeasurementCaptured?: (heightMm: number) => void;
+  onMeasurementPickStateChange?: (active: boolean) => void;
+  onMeasurementVisibilityChange?: (visible: boolean) => void;
+  onRotationDraftChange?: (angles: Record<MeshRotationAxis, number>) => void;
 }
 
 interface ViewState {
@@ -95,9 +112,11 @@ interface SessionSnapshot {
   positions: Float32Array | null;
   indices: Uint32Array | null;
   referencePositions: Float32Array | null;
+  uvs: Float32Array | null;
   history: SculptHistorySnapshot | null;
   selectedTriangleMask: Uint8Array | null;
   selectedTriangleCount: number;
+  faceMaterialIndices: Uint8Array | null;
 }
 
 interface SessionInstallOptions {
@@ -106,6 +125,20 @@ interface SessionInstallOptions {
   resetView?: boolean;
   selectedTriangleMask?: Uint8Array | null;
   selectedTriangleCount?: number;
+  faceMaterialIndices?: Uint8Array | null;
+  texture?: Texture | null;
+}
+
+interface ViewTransition {
+  startTime: number;
+  duration: number;
+  radius: number;
+  fromTheta: number;
+  toTheta: number;
+  fromPhi: number;
+  toPhi: number;
+  fromUp: Vector3;
+  toUp: Vector3;
 }
 
 interface BoundarySessionState {
@@ -124,6 +157,19 @@ export interface ViewportActionResult {
   stats: MeshStats | null;
 }
 
+export interface ExportedMeshFile {
+  filename: string;
+  blob: Blob;
+}
+
+export interface ObjExportResult {
+  files: ExportedMeshFile[];
+  referencesTexture: boolean;
+}
+
+export type MeshViewMode = 'colored' | 'shaded' | 'wireframe';
+export type MeshRotationAxis = 'x' | 'y' | 'z';
+
 type ViewportHistoryAction =
   | {
       kind: 'stroke';
@@ -137,12 +183,24 @@ type ViewportHistoryAction =
 
 type SelectionOperation = 'replace' | 'add' | 'subtract';
 type OrbitMouseAction = (typeof MOUSE)[keyof typeof MOUSE];
+type OrientationView = 'front' | 'left' | 'right' | 'back' | 'proximal' | 'distal';
 
 const DISABLED_MOUSE_ACTION = -1 as OrbitMouseAction;
 const HOLE_LOOP_HOVER_DISTANCE_PX = 16;
 const HOLE_FILL_DEBUG = true;
 const ACTION_HISTORY_LIMIT = 12;
 const SCULPT_HISTORY_LIMIT = 12;
+const MEASUREMENT_SPACING_MM = 25;
+const POSITIVE_AUTO_FULL_REMESH_MM = 3;
+const POSITIVE_AUTO_BOUNDARY_SMOOTH = 0.2;
+const POSITIVE_AUTO_BOUNDARY_SMOOTH_ITERATIONS = 10;
+const POSITIVE_AUTO_FIXED_REMESH_MM = 3.2;
+const POSITIVE_AUTO_NORMAL_EXTRUDE_MM = 3;
+const POSITIVE_AUTO_Z_PLANE_OFFSET_MM = 75;
+
+function lerp(start: number, end: number, alpha: number): number {
+  return start + (end - start) * alpha;
+}
 
 export class ViewportController {
   private readonly container: HTMLElement;
@@ -172,20 +230,20 @@ export class ViewportController {
   private readonly triangleWorldA = new Vector3();
   private readonly triangleWorldB = new Vector3();
   private readonly triangleWorldC = new Vector3();
-  private readonly triangleNormal = new Vector3();
-  private readonly triangleWorldNormal = new Vector3();
-  private readonly cameraWorldPosition = new Vector3();
-  private readonly viewDirection = new Vector3();
   private readonly projectedPoint = new Vector3();
   private readonly projectedPointA = new Vector3();
   private readonly projectedPointB = new Vector3();
   private readonly projectedPointC = new Vector3();
+  private readonly viewCubeSpherical = new Spherical();
   private readonly resizeObserver: ResizeObserver;
 
   private editableMesh: EditableMeshData | null = null;
   private sculptEngine: SculptEngine | null = null;
   private mesh: Mesh | null = null;
-  private meshMaterial: MeshMatcapMaterial | null = null;
+  private meshMaterial: Material | Material[] | null = null;
+  private meshTexture: Texture | null = null;
+  private meshViewMode: MeshViewMode = 'colored';
+  private faceMaterialIndices: Uint8Array | null = null;
   private cursor: Mesh | null = null;
   private selectionOverlay: Mesh | null = null;
   private selectionOverlayGeometry: BufferGeometry | null = null;
@@ -193,8 +251,25 @@ export class ViewportController {
   private holeLoopOverlayGeometry: LineSegmentsGeometry | null = null;
   private holeHoverOverlay: LineSegments2 | null = null;
   private holeHoverOverlayGeometry: LineSegmentsGeometry | null = null;
+  private measurementOverlay: LineSegments2 | null = null;
+  private measurementOverlayGeometry: LineSegmentsGeometry | null = null;
+  private measurementHeightOverlay: LineSegments2 | null = null;
+  private measurementHeightOverlayGeometry: LineSegmentsGeometry | null = null;
+  private rotationOverlay: Group | null = null;
+  private rotationRings: Mesh[] = [];
+  private rotationHoveredRing: Mesh | null = null;
+  private rotationOverlayVisible = false;
+  private rotationDragAxis: MeshRotationAxis | null = null;
+  private rotationDragPointerId = -1;
+  private rotationDragStartVector: Vector3 | null = null;
+  private rotationDragStartAngles: Record<MeshRotationAxis, number> = { x: 0, y: 0, z: 0 };
+  private rotationDraftAngles: Record<MeshRotationAxis, number> = { x: 0, y: 0, z: 0 };
+  private rotationDraftBeforeSnapshot: SessionSnapshot | null = null;
+  private rotationDraftBasePositions: Float32Array | null = null;
+  private rotationDraftBaseReferencePositions: Float32Array | null = null;
+  private rotationDraftCenter: Vector3 | null = null;
+  private rotationDraftRadius = 1;
   private holeLoops: HoleLoop[] = [];
-  private wireframeEnabled = false;
   private pointerInside = false;
   private pointerDown = false;
   private activeStroke = false;
@@ -217,12 +292,18 @@ export class ViewportController {
   private hoverHit: HoverHit | null = null;
   private interactionMode: InteractionMode = 'sculpt';
   private selectionTool: SelectionTool = 'sphere';
+  private selectOnlyVisible = true;
   private selectionOperation: SelectionOperation = 'replace';
   private selectionPath: Vector2[] = [];
   private selectedTriangleMask: Uint8Array | null = null;
   private selectedTriangleCount = 0;
   private selectionDirty = false;
-  private brushType: BrushType = 'bump';
+  private measurementState: MeasurementState = createEmptyMeasurementState();
+  private measurementDistalY = 0;
+  private measurementHeightPoint: Vector3 | null = null;
+  private measurementCircumferenceVisible = false;
+  private measurementPickActive = false;
+  private brushType: BrushType = 'smooth';
   private brushRadiusMm = 5;
   private brushStrength = 0.35;
   private selectionRadiusMm = 6;
@@ -230,6 +311,9 @@ export class ViewportController {
   private currentSessionId = 0;
   private historyUndoStack: ViewportHistoryAction[] = [];
   private historyRedoStack: ViewportHistoryAction[] = [];
+  private lastViewCubeTransform = '';
+  private lastViewCubeAzimuthDeg: number | null = null;
+  private viewTransition: ViewTransition | null = null;
 
   constructor(container: HTMLElement, callbacks: ViewportCallbacks = {}) {
     this.container = container;
@@ -266,8 +350,8 @@ export class ViewportController {
     this.controls.dampingFactor = 0.08;
     this.controls.target.set(0, 0, 0);
     this.controls.mouseButtons.LEFT = DISABLED_MOUSE_ACTION;
-    this.controls.mouseButtons.MIDDLE = MOUSE.ROTATE;
-    this.controls.mouseButtons.RIGHT = MOUSE.PAN;
+    this.controls.mouseButtons.MIDDLE = MOUSE.PAN;
+    this.controls.mouseButtons.RIGHT = MOUSE.ROTATE;
 
     this.raycaster.firstHitOnly = true;
 
@@ -300,6 +384,7 @@ export class ViewportController {
       this.finishSelectionGesture();
     }
 
+    this.updateMeasurementOverlayVisibility();
     const shouldEnableFill = mode === 'fill' || mode === 'boundary' || mode === 'positive';
     if (shouldEnableFill !== this.holeFillMode) {
       this.holeFillMode = shouldEnableFill;
@@ -316,14 +401,157 @@ export class ViewportController {
     this.emitBoundaryWorkflow();
   }
 
+  getMeasurementState(): MeasurementState {
+    return {
+      rows: this.measurementState.rows.map((row) => ({ ...row })),
+      totalHeightMm: this.measurementState.totalHeightMm,
+      clickedHeightMm: this.measurementState.clickedHeightMm,
+    };
+  }
+
+  setMeasurementCircumferenceVisible(visible: boolean): void {
+    this.measurementCircumferenceVisible = visible;
+    if (!visible) {
+      this.clearMeasurementHeight();
+      this.cancelMeasurementPick();
+    }
+    this.updateMeasurementOverlayVisibility();
+    this.callbacks.onMeasurementVisibilityChange?.(visible);
+  }
+
+  clearMeasurementHeight(): void {
+    if (this.measurementState.clickedHeightMm === null && !this.measurementHeightPoint) {
+      return;
+    }
+
+    this.measurementState = {
+      ...this.measurementState,
+      clickedHeightMm: null,
+    };
+    this.measurementHeightPoint = null;
+    this.rebuildMeasurementHeightOverlay();
+    this.emitMeasurements();
+  }
+
+  beginMeasurementPick(): boolean {
+    if (!this.mesh || !this.editableMesh || !this.measurementCircumferenceVisible) {
+      return false;
+    }
+
+    this.measurementPickActive = true;
+    this.callbacks.onMeasurementPickStateChange?.(true);
+    return true;
+  }
+
+  cancelMeasurementPick(): void {
+    if (!this.measurementPickActive) {
+      return;
+    }
+
+    this.measurementPickActive = false;
+    this.callbacks.onMeasurementPickStateChange?.(false);
+  }
+
   setSelectionTool(tool: SelectionTool): void {
     this.selectionTool = tool;
     this.finishSelectionGesture();
     this.updateCursorVisuals();
   }
 
+  setMeshViewMode(mode: MeshViewMode): void {
+    if (this.meshViewMode === mode) {
+      return;
+    }
+
+    this.meshViewMode = mode;
+    if (!this.mesh) {
+      return;
+    }
+
+    const nextMaterial = createMeshMaterials(
+      this.meshTexture,
+      this.sculptMatcapTexture,
+      this.faceMaterialIndices,
+      this.meshViewMode,
+    );
+    disposeMaterial(this.meshMaterial);
+    this.meshMaterial = nextMaterial;
+    this.mesh.material = nextMaterial;
+  }
+
+  setSelectOnlyVisible(enabled: boolean): void {
+    this.selectOnlyVisible = enabled;
+  }
+
   setSelectionRadiusMm(radiusMm: number): void {
     this.selectionRadiusMm = radiusMm;
+  }
+
+  setRotationOverlayVisible(visible: boolean): void {
+    this.rotationOverlayVisible = visible;
+    this.ensureRotationOverlay();
+    if (visible) {
+      this.beginRotationDraft();
+    }
+    if (this.rotationOverlay) {
+      this.rotationOverlay.visible = visible && Boolean(this.editableMesh);
+      this.updateRotationOverlayScale();
+    }
+
+    if (!visible) {
+      this.finishRotationDraft(true);
+    }
+    this.updateCursorVisuals();
+    this.updateHoleLoopOverlayVisibility();
+    this.rebuildSelectionOverlay();
+  }
+
+  setMeshRotationDraft(
+    angles: Partial<Record<MeshRotationAxis, number>>,
+    emitChange = true,
+  ): ViewportActionResult {
+    if (!this.editableMesh || !this.sculptEngine) {
+      return {
+        success: false,
+        message: 'Load a mesh before rotating.',
+        stats: null,
+      };
+    }
+
+    if (!this.rotationDraftBasePositions || !this.rotationDraftBaseReferencePositions) {
+      this.beginRotationDraft();
+    }
+
+    const nextAngles = {
+      x: angles.x ?? this.rotationDraftAngles.x,
+      y: angles.y ?? this.rotationDraftAngles.y,
+      z: angles.z ?? this.rotationDraftAngles.z,
+    };
+    if (!Number.isFinite(nextAngles.x) || !Number.isFinite(nextAngles.y) || !Number.isFinite(nextAngles.z)) {
+      return {
+        success: false,
+        message: 'Enter valid rotation angles.',
+        stats: null,
+      };
+    }
+
+    this.finishStroke();
+    this.finishSelectionGesture();
+    this.rotationDraftAngles = nextAngles;
+    this.applyRotationDraft();
+    if (emitChange) {
+      this.callbacks.onRotationDraftChange?.({ ...this.rotationDraftAngles });
+    }
+
+    return {
+      success: true,
+      message: `Rotation set to X ${nextAngles.x.toFixed(3)}, Y ${nextAngles.y.toFixed(3)}, Z ${nextAngles.z.toFixed(3)} deg.`,
+      stats: {
+        vertexCount: this.editableMesh.vertexCount,
+        triangleCount: this.editableMesh.triangleCount,
+        boundsRadius: this.editableMesh.boundsRadius,
+      },
+    };
   }
 
   setFillHoleMode(enabled: boolean): HoleLoopSummary | null {
@@ -338,11 +566,88 @@ export class ViewportController {
     };
   }
 
-  setWireframe(enabled: boolean): void {
-    this.wireframeEnabled = enabled;
-    if (this.meshMaterial) {
-      this.meshMaterial.wireframe = enabled;
+  setOrientationView(view: OrientationView): void {
+    const direction = new Vector3();
+    const up = new Vector3(0, 1, 0);
+
+    switch (view) {
+      case 'left':
+        direction.set(-1, 0, 0);
+        break;
+      case 'right':
+        direction.set(1, 0, 0);
+        break;
+      case 'back':
+        direction.set(0, 0, -1);
+        break;
+      case 'proximal':
+        direction.set(0, 1, 0);
+        break;
+      case 'distal':
+        direction.set(0, -1, 0);
+        break;
+      case 'front':
+      default:
+        direction.set(0, 0, 1);
+        break;
     }
+
+    this.setOrientationDirection(direction, up);
+  }
+
+  setOrientationDirection(direction: Vector3, up = new Vector3(0, 1, 0)): void {
+    if (direction.lengthSq() <= 1e-8) {
+      return;
+    }
+
+    const currentOffset = this.camera.position.clone().sub(this.controls.target);
+    const currentDistance = Math.max(currentOffset.length(), 0.5);
+    this.viewCubeSpherical.setFromVector3(currentOffset);
+
+    const targetDirection = direction.clone().normalize();
+    const targetSpherical = new Spherical().setFromVector3(targetDirection.multiplyScalar(currentDistance));
+    if (Math.abs(direction.y) > 0.999 && Math.abs(direction.x) + Math.abs(direction.z) <= 1e-8) {
+      targetSpherical.phi = direction.y > 0 ? 0.08 : Math.PI - 0.08;
+    }
+    const targetTheta = this.shortestTheta(this.viewCubeSpherical.theta, targetSpherical.theta);
+
+    this.viewTransition = {
+      startTime: performance.now(),
+      duration: 320,
+      radius: currentDistance,
+      fromTheta: this.viewCubeSpherical.theta,
+      toTheta: targetTheta,
+      fromPhi: this.viewCubeSpherical.phi,
+      toPhi: targetSpherical.phi,
+      fromUp: this.camera.up.clone(),
+      toUp: up.clone().normalize(),
+    };
+    const boundsRadius = Math.max(this.editableMesh?.boundsRadius ?? 1, 0.5);
+    this.camera.near = Math.max(boundsRadius / 500, 0.001);
+    this.camera.far = Math.max(boundsRadius * 25, 10);
+    this.camera.updateProjectionMatrix();
+  }
+
+  setOrientationVector(x: number, y: number, z: number): void {
+    this.setOrientationDirection(new Vector3(x, y, z), new Vector3(0, 1, 0));
+  }
+
+  orbitFromViewCube(deltaX: number, deltaY: number): void {
+    this.viewTransition = null;
+    const offset = this.camera.position.clone().sub(this.controls.target);
+    const distance = offset.length();
+    if (distance <= 1e-8) {
+      return;
+    }
+
+    this.viewCubeSpherical.setFromVector3(offset);
+    this.viewCubeSpherical.theta -= deltaX * 0.012;
+    this.viewCubeSpherical.phi = Math.max(0.08, Math.min(Math.PI - 0.08, this.viewCubeSpherical.phi + deltaY * 0.012));
+    offset.setFromSpherical(this.viewCubeSpherical);
+    this.camera.position.copy(this.controls.target).add(offset);
+    this.camera.up.set(0, 1, 0);
+    this.camera.lookAt(this.controls.target);
+    this.controls.update();
   }
 
   getHoleLoopSummary(): HoleLoopSummary | null {
@@ -406,6 +711,10 @@ export class ViewportController {
     this.boundaryOffsetApplied = false;
     this.updateHoleHoverOverlay();
     this.emitBoundaryWorkflow();
+
+    if (this.interactionMode === 'positive') {
+      return this.runPositiveLimbAutomation();
+    }
 
     return {
       success: true,
@@ -670,7 +979,7 @@ export class ViewportController {
     if (!this.boundaryGuide || !this.boundaryRemeshApplied) {
       return {
         success: false,
-        message: 'Run the fixed-boundary remesh before previewing a positive socket extrusion.',
+        message: 'Run the fixed-boundary remesh before previewing a positive limb extrusion.',
         stats: null,
       };
     }
@@ -737,7 +1046,7 @@ export class ViewportController {
 
     return {
       success: true,
-      message: `Previewing a positive socket extrusion at ${distance.toFixed(3)} mm.`,
+      message: `Previewing a positive limb extrusion at ${distance.toFixed(3)} mm.`,
       stats: {
         vertexCount: this.editableMesh?.vertexCount ?? 0,
         triangleCount: this.editableMesh?.triangleCount ?? 0,
@@ -781,6 +1090,134 @@ export class ViewportController {
         boundsRadius: this.editableMesh?.boundsRadius ?? 0,
       },
     };
+  }
+
+  private runPositiveLimbAutomation(): ViewportActionResult {
+    if (!this.editableMesh || !this.sculptEngine || !this.boundaryGuide || !this.activeBoundaryVertexIds) {
+      return {
+        success: false,
+        message: 'Target a boundary loop before running Positive Limb.',
+        stats: null,
+      };
+    }
+
+    this.sculptEngine.discardRedoHistory();
+    const beforeSnapshot = this.boundaryPreviewBaseSnapshot ?? this.captureSessionSnapshot();
+    const viewState = this.captureViewState();
+    const initialGuide = this.boundaryGuide.slice();
+    const initialBoundary = this.activeBoundaryVertexIds.slice();
+    const capPlaneZ = computeHighestZ(this.editableMesh.positions, initialBoundary) + POSITIVE_AUTO_Z_PLANE_OFFSET_MM;
+
+    try {
+      let editable = this.installAutomatedGeometry(
+        surfaceRemeshMesh(this.editableMesh, POSITIVE_AUTO_FULL_REMESH_MM, { boundaryMode: 'refined' }).geometry,
+        viewState,
+      );
+      this.boundaryGuide = initialGuide;
+      this.activeBoundaryVertexIds = this.resolveBoundaryLoopVertexIds(editable, initialGuide);
+      if (!this.activeBoundaryVertexIds) {
+        throw new Error('The selected boundary could not be found after the first 3.000 mm remesh.');
+      }
+
+      const smoothedPositions = smoothBoundaryLoopVertices(
+        editable.positions,
+        editable.normals,
+        this.activeBoundaryVertexIds,
+        POSITIVE_AUTO_BOUNDARY_SMOOTH,
+        POSITIVE_AUTO_BOUNDARY_SMOOTH_ITERATIONS,
+        { constrainToTangent: false },
+      );
+      if (!smoothedPositions) {
+        throw new Error('The selected boundary could not be smoothed.');
+      }
+      this.applyPositionsInPlace(smoothedPositions);
+      if (!this.editableMesh) {
+        throw new Error('Positive Limb lost the active mesh after boundary smoothing.');
+      }
+      editable = this.editableMesh;
+      const smoothedGuide = captureBoundaryGuide(editable.positions, this.activeBoundaryVertexIds);
+      if (!smoothedGuide) {
+        throw new Error('The selected boundary guide could not be rebuilt after smoothing.');
+      }
+      this.boundaryGuide = smoothedGuide.slice();
+
+      editable = this.installAutomatedGeometry(
+        surfaceRemeshMesh(editable, POSITIVE_AUTO_FIXED_REMESH_MM, { boundaryMode: 'fixed' }).geometry,
+        viewState,
+      );
+      this.boundaryGuide = smoothedGuide;
+      this.activeBoundaryVertexIds = this.resolveBoundaryLoopVertexIds(editable, smoothedGuide);
+      if (!this.activeBoundaryVertexIds) {
+        throw new Error('The selected boundary could not be found after the 3.200 mm fixed remesh.');
+      }
+
+      const normalExtrude = extrudeBoundaryLoop(
+        editable,
+        this.activeBoundaryVertexIds,
+        POSITIVE_AUTO_NORMAL_EXTRUDE_MM,
+      );
+      editable = this.installAutomatedGeometry(normalExtrude.geometry, viewState);
+      this.activeBoundaryVertexIds = normalExtrude.outerVertexIds.slice();
+      this.boundaryGuide = captureBoundaryGuide(editable.positions, this.activeBoundaryVertexIds);
+
+      const zExtrude = extrudeBoundaryLoopToZPlane(editable, this.activeBoundaryVertexIds, capPlaneZ);
+      const finalGeometry = zExtrude.geometry;
+      orientGeometryOutward(finalGeometry);
+      editable = this.installAutomatedGeometry(finalGeometry, viewState);
+
+      this.activeBoundaryLoopIndex = -1;
+      this.activeBoundaryVertexIds = null;
+      this.boundaryGuide = null;
+      this.boundaryPreviewBaseSnapshot = null;
+      this.boundaryThickenPreviewBaseSnapshot = null;
+      this.boundaryExtrudePreviewBaseSnapshot = null;
+      this.boundaryFinalSmoothPreviewBaseSnapshot = null;
+      this.boundaryDirectionalExtrudePreviewBaseSnapshot = null;
+      this.boundarySmoothCommitted = true;
+      this.boundaryRemeshApplied = true;
+      this.boundaryThickenApplied = false;
+      this.boundaryExtrudeApplied = true;
+      this.boundaryOffsetApplied = true;
+      this.updateHoleHoverOverlay();
+      this.emitBoundaryWorkflow();
+
+      const afterSnapshot = this.captureSessionSnapshot();
+      if (beforeSnapshot.positions && !floatArraysEqual(beforeSnapshot.positions, afterSnapshot.positions)) {
+        this.pushHistoryAction({
+          kind: 'session',
+          before: beforeSnapshot,
+          after: afterSnapshot,
+        });
+        this.emitHistory();
+      }
+
+      const finalNonManifoldEdges = countNonManifoldEdges(editable.indices, editable.referencePositions);
+      const manifoldNote =
+        finalNonManifoldEdges === 0
+          ? ' Mesh is manifold by boundary-loop check.'
+          : ` ${finalNonManifoldEdges} non-manifold boundary edges remain.`;
+      return {
+        success: true,
+        message:
+          `Positive Limb complete: 3.000 mm remesh, 0.200 boundary smooth, 3.200 mm fixed remesh, 3.000 mm normal extrusion, and capped +Z plane at ${capPlaneZ.toFixed(1)} mm.` +
+          manifoldNote,
+        stats: {
+          vertexCount: editable.vertexCount,
+          triangleCount: editable.triangleCount,
+          boundsRadius: editable.boundsRadius,
+        },
+      };
+    } catch (error) {
+      console.error(error);
+      if (beforeSnapshot.positions) {
+        this.applySessionSnapshot(beforeSnapshot, viewState);
+      }
+      return {
+        success: false,
+        message: error instanceof Error ? error.message : 'Positive Limb automation failed.',
+        stats: null,
+      };
+    }
   }
 
   previewBoundaryBand(distanceMm: number): ViewportActionResult {
@@ -962,7 +1399,7 @@ export class ViewportController {
     if (!this.boundaryGuide) {
       return {
         success: false,
-        message: 'Finish the positive socket smoothing stages before previewing the final wall extrusion.',
+        message: 'Finish the positive limb smoothing stages before previewing the final wall extrusion.',
         stats: null,
       };
     }
@@ -1079,6 +1516,7 @@ export class ViewportController {
   resetView(): void {
     if (!this.editableMesh) {
       this.controls.target.set(0, 0, 0);
+      this.camera.up.set(0, 1, 0);
       this.camera.position.set(2.8, 1.8, 3.4);
       this.camera.near = 0.01;
       this.camera.far = 1000;
@@ -1089,6 +1527,7 @@ export class ViewportController {
 
     const radius = Math.max(this.editableMesh.boundsRadius, 0.5);
     const distance = radius / Math.tan((this.camera.fov * Math.PI) / 360) * 1.25;
+    this.camera.up.set(0, 1, 0);
     this.camera.position.set(radius * 1.35, radius * 0.9, distance);
     this.camera.near = Math.max(radius / 500, 0.001);
     this.camera.far = Math.max(radius * 25, 10);
@@ -1097,12 +1536,62 @@ export class ViewportController {
     this.controls.update();
   }
 
-  setSession(meshData: EditableMeshData, sculptEngine: SculptEngine): void {
+  setSession(meshData: EditableMeshData, sculptEngine: SculptEngine, texture: Texture | null = null): void {
     this.installSession(meshData, sculptEngine, {
       sessionId: this.allocateSessionId(),
       resetActionHistory: true,
       resetView: true,
+      texture,
     });
+  }
+
+  exportStl(baseName: string): ExportedMeshFile | null {
+    if (!this.editableMesh || this.editableMesh.triangleCount === 0) {
+      return null;
+    }
+
+    const stl = serializeAsciiStl(
+      sanitizeExportName(baseName),
+      this.editableMesh.positions,
+      this.editableMesh.indices,
+    );
+    return {
+      filename: `${sanitizeExportName(baseName)}.stl`,
+      blob: new Blob([stl], { type: 'model/stl' }),
+    };
+  }
+
+  exportObj(baseName: string, textureFilename: string | null = null): ObjExportResult | null {
+    if (!this.editableMesh || this.editableMesh.triangleCount === 0) {
+      return null;
+    }
+
+    const exportName = sanitizeExportName(baseName);
+    const uvs = copyGeometryUvs(this.editableMesh.geometry);
+    const referencesTexture = Boolean(textureFilename && uvs);
+    const obj = serializeObj({
+      objectName: exportName,
+      materialFilename: `${exportName}.mtl`,
+      positions: this.editableMesh.positions,
+      indices: this.editableMesh.indices,
+      uvs,
+      faceMaterialIndices: this.faceMaterialIndices,
+      scanMaterialName: referencesTexture ? 'scan_texture' : 'scan_neutral',
+      fillMaterialName: 'fill_light_gray',
+    });
+    const mtl = serializeMtl({
+      scanMaterialName: referencesTexture ? 'scan_texture' : 'scan_neutral',
+      fillMaterialName: 'fill_light_gray',
+      textureFilename: referencesTexture ? textureFilename : null,
+    });
+
+    return {
+      files: [
+        { filename: `${exportName}.obj`, blob: new Blob([obj], { type: 'model/obj' }) },
+        { filename: `${exportName}.mtl`, blob: new Blob([mtl], { type: 'text/plain' }) },
+      ],
+      referencesTexture,
+    };
   }
 
   private installSession(
@@ -1112,7 +1601,11 @@ export class ViewportController {
   ): void {
     this.finishStroke();
     this.finishSelectionGesture();
-    this.clearSceneMesh();
+    const nextTexture = options.texture === undefined ? this.meshTexture : options.texture;
+    this.clearSceneMesh(nextTexture !== this.meshTexture);
+    if (nextTexture) {
+      this.configureDisplayTexture(nextTexture);
+    }
 
     if (options.resetActionHistory) {
       this.historyUndoStack = [];
@@ -1140,15 +1633,20 @@ export class ViewportController {
         ? options.selectedTriangleMask.slice()
         : new Uint8Array(meshData.triangleCount);
     this.selectedTriangleCount = countSelectedTriangles(this.selectedTriangleMask);
+    this.faceMaterialIndices =
+      options.faceMaterialIndices && options.faceMaterialIndices.length === meshData.triangleCount
+        ? options.faceMaterialIndices.slice()
+        : null;
     this.selectionDirty = true;
+    applyFaceMaterialGroups(meshData.geometry, this.faceMaterialIndices);
 
-    this.meshMaterial = new MeshMatcapMaterial({
-      color: '#e8ebef',
-      matcap: this.sculptMatcapTexture,
-      side: DoubleSide,
-      wireframe: this.wireframeEnabled,
-      vertexColors: true,
-    });
+    this.meshMaterial = createMeshMaterials(
+      nextTexture,
+      this.sculptMatcapTexture,
+      this.faceMaterialIndices,
+      this.meshViewMode,
+    );
+    this.meshTexture = nextTexture ?? null;
 
     this.mesh = new Mesh(meshData.geometry, this.meshMaterial);
     this.mesh.frustumCulled = false;
@@ -1188,6 +1686,39 @@ export class ViewportController {
     this.selectionOverlay.renderOrder = 4;
     this.mesh.add(this.selectionOverlay);
 
+    this.measurementOverlayGeometry = new LineSegmentsGeometry();
+    const measurementMaterial = new LineMaterial({
+      color: '#0694a2',
+      linewidth: 2.4,
+      transparent: true,
+      opacity: 0.95,
+      depthTest: false,
+      depthWrite: false,
+    });
+    this.updateSingleLineMaterialResolution(measurementMaterial);
+    this.measurementOverlay = new LineSegments2(this.measurementOverlayGeometry, measurementMaterial);
+    this.measurementOverlay.frustumCulled = false;
+    this.measurementOverlay.visible = false;
+    this.measurementOverlay.renderOrder = 8;
+    this.mesh.add(this.measurementOverlay);
+
+    this.measurementHeightOverlayGeometry = new LineSegmentsGeometry();
+    const heightMaterial = new LineMaterial({
+      color: '#111827',
+      linewidth: 3,
+      transparent: true,
+      opacity: 0.95,
+      depthTest: false,
+      depthWrite: false,
+    });
+    this.updateSingleLineMaterialResolution(heightMaterial);
+    this.measurementHeightOverlay = new LineSegments2(this.measurementHeightOverlayGeometry, heightMaterial);
+    this.measurementHeightOverlay.frustumCulled = false;
+    this.measurementHeightOverlay.visible = false;
+    this.measurementHeightOverlay.renderOrder = 9;
+    this.mesh.add(this.measurementHeightOverlay);
+    this.rebuildMeasurements();
+
     if (this.holeFillMode) {
       this.rebuildHoleLoopOverlays();
       this.updateHoleLoopOverlayVisibility();
@@ -1196,12 +1727,25 @@ export class ViewportController {
     if (options.resetView !== false) {
       this.resetView();
     }
+    if (this.rotationOverlay) {
+      this.rotationOverlay.visible = this.rotationOverlayVisible;
+      this.updateRotationOverlayScale();
+    }
     this.rebuildSelectionOverlay();
     this.emitHistory();
     this.emitSelection();
     this.emitBoundaryWorkflow();
     this.emitMeshStats();
     this.updateCursorVisuals();
+  }
+
+  private configureDisplayTexture(texture: Texture): void {
+    texture.colorSpace = SRGBColorSpace;
+    texture.magFilter = LinearFilter;
+    texture.minFilter = LinearMipmapLinearFilter;
+    texture.generateMipmaps = true;
+    texture.anisotropy = Math.max(texture.anisotropy, this.renderer.capabilities.getMaxAnisotropy());
+    texture.needsUpdate = true;
   }
 
   dispose(): void {
@@ -1221,6 +1765,7 @@ export class ViewportController {
     this.controls.dispose();
     this.renderer.setAnimationLoop(null);
     this.sculptMatcapTexture.dispose();
+    this.disposeRotationOverlay();
     this.renderer.dispose();
     this.clearSceneMesh();
   }
@@ -1305,6 +1850,8 @@ export class ViewportController {
       this.editableMesh.indices,
       this.editableMesh.referencePositions,
       this.selectedTriangleMask,
+      copyGeometryUvs(this.editableMesh.geometry),
+      this.faceMaterialIndices,
     );
 
     if (!nextMesh.geometry || !nextMesh.referencePositions) {
@@ -1342,9 +1889,11 @@ export class ViewportController {
       positions: editable.positions.slice(),
       indices: editable.indices.slice(),
       referencePositions: editable.referencePositions.slice(),
+      uvs: copyGeometryUvs(editable.geometry),
       history: engine.exportHistorySnapshot(),
       selectedTriangleMask: new Uint8Array(editable.triangleCount),
       selectedTriangleCount: 0,
+      faceMaterialIndices: nextMesh.faceMaterialIndices,
     } satisfies SessionSnapshot;
     this.pushHistoryAction({
       kind: 'session',
@@ -1355,6 +1904,7 @@ export class ViewportController {
       sessionId: nextSessionId,
       resetActionHistory: false,
       resetView: false,
+      faceMaterialIndices: nextMesh.faceMaterialIndices,
     });
     this.restoreViewState(viewState);
 
@@ -1409,9 +1959,11 @@ export class ViewportController {
       positions: editable.positions.slice(),
       indices: editable.indices.slice(),
       referencePositions: editable.referencePositions.slice(),
+      uvs: copyGeometryUvs(editable.geometry),
       history: engine.exportHistorySnapshot(),
       selectedTriangleMask: refined.selectedTriangleMask.slice(),
       selectedTriangleCount,
+      faceMaterialIndices: null,
     } satisfies SessionSnapshot;
     this.pushHistoryAction({
       kind: 'session',
@@ -1489,9 +2041,11 @@ export class ViewportController {
         positions: editable.positions.slice(),
         indices: editable.indices.slice(),
         referencePositions: editable.referencePositions.slice(),
+        uvs: copyGeometryUvs(editable.geometry),
         history: engine.exportHistorySnapshot(),
         selectedTriangleMask: remeshed.selectedTriangleMask.slice(),
         selectedTriangleCount,
+        faceMaterialIndices: null,
       } satisfies SessionSnapshot;
       this.pushHistoryAction({
         kind: 'session',
@@ -1855,6 +2409,7 @@ export class ViewportController {
 
   private readonly handlePointerLeave = (): void => {
     this.pointerInside = false;
+    this.setHoveredRotationRing(null);
     if (!this.activeStroke && !this.selectionGestureActive && this.cursor) {
       this.cursor.visible = false;
     }
@@ -1862,6 +2417,14 @@ export class ViewportController {
 
   private readonly handlePointerMove = (event: PointerEvent): void => {
     this.updatePointerFromEvent(event);
+
+    if (this.rotationDragAxis && event.pointerId === this.rotationDragPointerId) {
+      this.updateRotationDrag(event);
+      event.preventDefault();
+      return;
+    }
+
+    this.updateRotationHover();
 
     if (!this.selectionGestureActive) {
       return;
@@ -1888,6 +2451,28 @@ export class ViewportController {
 
     this.pointerDown = true;
     this.updatePointerFromEvent(event);
+
+    if (this.tryBeginRotationDrag(event)) {
+      event.preventDefault();
+      return;
+    }
+
+    if (this.rotationOverlayVisible) {
+      event.preventDefault();
+      return;
+    }
+
+    if (this.measurementPickActive) {
+      const measured = this.measureHeightAtPointer();
+      if (measured) {
+        this.measurementPickActive = false;
+        this.callbacks.onMeasurementPickStateChange?.(false);
+      }
+      event.preventDefault();
+      return;
+    }
+
+    this.resetMeasurementForModelAction();
 
     if (this.holeFillMode) {
       this.debugHoleFill('pointerdown', {
@@ -1966,6 +2551,12 @@ export class ViewportController {
 
   private readonly handlePointerUp = (event: PointerEvent): void => {
     this.pointerDown = false;
+    if (this.rotationDragAxis && event.pointerId === this.rotationDragPointerId) {
+      this.finishRotationDrag();
+      event.preventDefault();
+      return;
+    }
+
     if (this.renderer.domElement.hasPointerCapture(event.pointerId)) {
       this.renderer.domElement.releasePointerCapture(event.pointerId);
     }
@@ -2004,6 +2595,7 @@ export class ViewportController {
         kind: 'stroke',
         sessionId: this.currentSessionId,
       });
+      this.rebuildMeasurements();
     }
     this.emitHistory();
   }
@@ -2022,6 +2614,7 @@ export class ViewportController {
   }
 
   private tick(): void {
+    this.updateViewTransition();
     this.controls.update();
     if (this.holeFillMode) {
       this.refreshHoverHit();
@@ -2046,6 +2639,7 @@ export class ViewportController {
     }
 
     this.drawSelectionPreview();
+    this.emitViewCubeTransform();
     this.renderer.render(this.scene, this.camera);
   }
 
@@ -2117,9 +2711,13 @@ export class ViewportController {
       pointLocal,
       this.getSelectionRadiusWorld(),
     );
-    this.applyTriangleSelection(
+    const visibleTriangleCount = this.filterVisibleTrianglesByCentroid(
       this.sculptEngine.data.regionTriangles,
       triangleCount,
+    );
+    this.applyTriangleSelection(
+      this.sculptEngine.data.regionTriangles,
+      visibleTriangleCount,
       this.selectionOperation,
     );
   }
@@ -2132,8 +2730,7 @@ export class ViewportController {
     const triangleIds = new Uint32Array(this.editableMesh.triangleCount);
     let triangleCount = 0;
 
-    this.camera.getWorldPosition(this.cameraWorldPosition);
-    const { indices, positions, faceNormals } = this.editableMesh;
+    const { indices, positions } = this.editableMesh;
     const width = this.overlayCanvas.clientWidth;
     const height = this.overlayCanvas.clientHeight;
 
@@ -2151,21 +2748,6 @@ export class ViewportController {
 
       this.triangleWorldPoint.copy(this.triangleCentroid);
       this.mesh.localToWorld(this.triangleWorldPoint);
-
-      this.triangleNormal.set(
-        faceNormals[triOffset],
-        faceNormals[triOffset + 1],
-        faceNormals[triOffset + 2],
-      );
-      if (this.triangleNormal.lengthSq() <= 1e-12) {
-        continue;
-      }
-
-      this.triangleWorldNormal.copy(this.triangleNormal).normalize();
-      this.viewDirection.copy(this.cameraWorldPosition).sub(this.triangleWorldPoint);
-      if (this.triangleWorldNormal.dot(this.viewDirection) <= 0) {
-        continue;
-      }
 
       this.projectedPoint.copy(this.triangleWorldPoint).project(this.camera);
       if (this.projectedPoint.z < -1 || this.projectedPoint.z > 1) {
@@ -2227,11 +2809,13 @@ export class ViewportController {
         continue;
       }
 
-      this.selectionRayNdc.set(this.projectedPoint.x, this.projectedPoint.y);
-      this.raycaster.setFromCamera(this.selectionRayNdc, this.camera);
-      const hit = this.raycaster.intersectObject(this.mesh, false)[0];
-      if (!hit || hit.faceIndex !== triangle) {
-        continue;
+      if (this.selectOnlyVisible) {
+        this.selectionRayNdc.set(this.projectedPoint.x, this.projectedPoint.y);
+        this.raycaster.setFromCamera(this.selectionRayNdc, this.camera);
+        const hit = this.raycaster.intersectObject(this.mesh, false)[0];
+        if (!hit || hit.faceIndex !== triangle) {
+          continue;
+        }
       }
 
       triangleIds[triangleCount] = triangle;
@@ -2239,6 +2823,46 @@ export class ViewportController {
     }
 
     this.applyTriangleSelection(triangleIds, triangleCount, this.selectionOperation);
+  }
+
+  private filterVisibleTrianglesByCentroid(triangleIds: Uint32Array, triangleCount: number): number {
+    if (!this.selectOnlyVisible || !this.editableMesh || !this.mesh) {
+      return triangleCount;
+    }
+
+    const { indices, positions } = this.editableMesh;
+    let visibleTriangleCount = 0;
+    for (let i = 0; i < triangleCount; i += 1) {
+      const triangle = triangleIds[i];
+      const triOffset = triangle * 3;
+      const a = indices[triOffset] * 3;
+      const b = indices[triOffset + 1] * 3;
+      const c = indices[triOffset + 2] * 3;
+
+      this.triangleCentroid.set(
+        (positions[a] + positions[b] + positions[c]) / 3,
+        (positions[a + 1] + positions[b + 1] + positions[c + 1]) / 3,
+        (positions[a + 2] + positions[b + 2] + positions[c + 2]) / 3,
+      );
+      this.triangleWorldPoint.copy(this.triangleCentroid);
+      this.mesh.localToWorld(this.triangleWorldPoint);
+      this.projectedPoint.copy(this.triangleWorldPoint).project(this.camera);
+      if (this.projectedPoint.z < -1 || this.projectedPoint.z > 1) {
+        continue;
+      }
+
+      this.selectionRayNdc.set(this.projectedPoint.x, this.projectedPoint.y);
+      this.raycaster.setFromCamera(this.selectionRayNdc, this.camera);
+      const hit = this.raycaster.intersectObject(this.mesh, false)[0];
+      if (!hit || hit.faceIndex !== triangle) {
+        continue;
+      }
+
+      triangleIds[visibleTriangleCount] = triangle;
+      visibleTriangleCount += 1;
+    }
+
+    return visibleTriangleCount;
   }
 
   private applyTriangleSelection(
@@ -2378,6 +3002,81 @@ export class ViewportController {
     return Math.max(this.selectionRadiusMm, 0.0005);
   }
 
+  private updateViewTransition(): void {
+    if (!this.viewTransition) {
+      return;
+    }
+
+    const elapsed = performance.now() - this.viewTransition.startTime;
+    const progress = Math.min(1, elapsed / this.viewTransition.duration);
+    const eased = 1 - Math.pow(1 - progress, 3);
+    this.viewCubeSpherical.radius = this.viewTransition.radius;
+    this.viewCubeSpherical.theta = lerp(this.viewTransition.fromTheta, this.viewTransition.toTheta, eased);
+    this.viewCubeSpherical.phi = lerp(this.viewTransition.fromPhi, this.viewTransition.toPhi, eased);
+    this.camera.position.copy(this.controls.target).add(new Vector3().setFromSpherical(this.viewCubeSpherical));
+    this.camera.up.lerpVectors(this.viewTransition.fromUp, this.viewTransition.toUp, eased).normalize();
+    this.camera.lookAt(this.controls.target);
+
+    if (progress >= 1) {
+      this.viewCubeSpherical.radius = this.viewTransition.radius;
+      this.viewCubeSpherical.theta = this.viewTransition.toTheta;
+      this.viewCubeSpherical.phi = this.viewTransition.toPhi;
+      this.camera.position.copy(this.controls.target).add(new Vector3().setFromSpherical(this.viewCubeSpherical));
+      this.camera.up.copy(this.viewTransition.toUp);
+      this.camera.lookAt(this.controls.target);
+      this.viewTransition = null;
+    }
+  }
+
+  private shortestTheta(from: number, to: number): number {
+    let delta = to - from;
+    while (delta > Math.PI) {
+      delta -= Math.PI * 2;
+    }
+    while (delta < -Math.PI) {
+      delta += Math.PI * 2;
+    }
+
+    return from + delta;
+  }
+
+  private emitViewCubeTransform(): void {
+    if (!this.callbacks.onViewCubeTransform) {
+      return;
+    }
+
+    const direction = this.camera.position.clone().sub(this.controls.target);
+    const horizontal = Math.hypot(direction.x, direction.z);
+    const rawAzimuth = Math.atan2(direction.x, direction.z) * (180 / Math.PI);
+    const azimuth = this.unwrapViewCubeAzimuth(rawAzimuth);
+    const elevation = Math.atan2(direction.y, horizontal) * (180 / Math.PI);
+    const transform = `rotateX(${elevation.toFixed(2)}deg) rotateY(${(-azimuth).toFixed(2)}deg)`;
+    if (transform === this.lastViewCubeTransform) {
+      return;
+    }
+
+    this.lastViewCubeTransform = transform;
+    this.callbacks.onViewCubeTransform(transform);
+  }
+
+  private unwrapViewCubeAzimuth(azimuthDeg: number): number {
+    if (this.lastViewCubeAzimuthDeg === null) {
+      this.lastViewCubeAzimuthDeg = azimuthDeg;
+      return azimuthDeg;
+    }
+
+    let delta = azimuthDeg - this.lastViewCubeAzimuthDeg;
+    while (delta > 180) {
+      delta -= 360;
+    }
+    while (delta < -180) {
+      delta += 360;
+    }
+
+    this.lastViewCubeAzimuthDeg += delta;
+    return this.lastViewCubeAzimuthDeg;
+  }
+
   private applyPositionsInPlace(nextPositions: Float32Array): void {
     if (!this.editableMesh) {
       return;
@@ -2412,7 +3111,357 @@ export class ViewportController {
         boundsTree?: { refit?: () => void };
       }
     ).boundsTree?.refit?.();
+    this.rebuildMeasurements();
     this.emitMeshStats();
+  }
+
+  private tryBeginRotationDrag(event: PointerEvent): boolean {
+    if (
+      !this.rotationOverlayVisible ||
+      !this.rotationOverlay ||
+      !this.editableMesh ||
+      !this.sculptEngine ||
+      this.rotationRings.length === 0
+    ) {
+      return false;
+    }
+
+    this.beginRotationDraft();
+    this.raycaster.setFromCamera(this.pointerNdc, this.camera);
+    const hits = this.raycaster.intersectObjects(this.rotationRings, false);
+    const ring = hits[0]?.object;
+    const axis = ring?.userData.axis as MeshRotationAxis | undefined;
+    if (axis !== 'x' && axis !== 'y' && axis !== 'z') {
+      return false;
+    }
+
+    const startVector = this.getRotationPlaneVectorFromPointer(axis);
+    if (!startVector) {
+      return false;
+    }
+
+    this.finishStroke();
+    this.finishSelectionGesture();
+    this.rotationDragAxis = axis;
+    this.rotationDragPointerId = event.pointerId;
+    this.rotationDragStartVector = startVector;
+    this.rotationDragStartAngles = { ...this.rotationDraftAngles };
+    this.setHoveredRotationRing(ring instanceof Mesh ? ring : null);
+    this.controls.enabled = false;
+    this.renderer.domElement.setPointerCapture(event.pointerId);
+    return true;
+  }
+
+  private updateRotationDrag(event: PointerEvent): void {
+    if (!this.rotationDragAxis || !this.rotationDragStartVector) {
+      return;
+    }
+
+    this.updatePointerFromEvent(event);
+    const currentVector = this.getRotationPlaneVectorFromPointer(this.rotationDragAxis);
+    if (!currentVector) {
+      return;
+    }
+
+    const axisVector = getRotationAxisVector(this.rotationDragAxis);
+    const angleDelta = signedAngleDegrees(this.rotationDragStartVector, currentVector, axisVector);
+    this.setMeshRotationDraft(
+      {
+        ...this.rotationDragStartAngles,
+        [this.rotationDragAxis]: this.rotationDragStartAngles[this.rotationDragAxis] + angleDelta,
+      },
+      true,
+    );
+  }
+
+  private finishRotationDrag(): void {
+    if (!this.rotationDragAxis) {
+      return;
+    }
+
+    const pointerId = this.rotationDragPointerId;
+    if (this.renderer.domElement.hasPointerCapture(pointerId)) {
+      this.renderer.domElement.releasePointerCapture(pointerId);
+    }
+
+    this.controls.enabled = true;
+    this.rotationDragAxis = null;
+    this.rotationDragPointerId = -1;
+    this.rotationDragStartVector = null;
+    this.rotationDragStartAngles = { ...this.rotationDraftAngles };
+    this.updateRotationHover();
+  }
+
+  private updateRotationHover(): void {
+    if (!this.rotationOverlayVisible || !this.rotationOverlay || this.rotationDragAxis) {
+      if (!this.rotationDragAxis) {
+        this.setHoveredRotationRing(null);
+      }
+      return;
+    }
+
+    this.raycaster.setFromCamera(this.pointerNdc, this.camera);
+    const hits = this.raycaster.intersectObjects(this.rotationRings, false);
+    const ring = hits[0]?.object;
+    this.setHoveredRotationRing(ring instanceof Mesh ? ring : null);
+  }
+
+  private setHoveredRotationRing(ring: Mesh | null): void {
+    if (this.rotationHoveredRing === ring) {
+      return;
+    }
+
+    if (this.rotationHoveredRing) {
+      this.setRotationRingHoverState(this.rotationHoveredRing, false);
+    }
+    this.rotationHoveredRing = ring;
+    if (this.rotationHoveredRing) {
+      this.setRotationRingHoverState(this.rotationHoveredRing, true);
+    }
+  }
+
+  private setRotationRingHoverState(ring: Mesh, hovered: boolean): void {
+    const material = ring.material as MeshBasicMaterial;
+    const baseColor = ring.userData.baseColor as string | undefined;
+    if (!baseColor) {
+      return;
+    }
+
+    material.color.set(baseColor);
+    if (hovered) {
+      material.color.lerp(new Color('#ffffff'), 0.34);
+      material.opacity = 1;
+      ring.scale.setScalar(1.022);
+    } else {
+      material.opacity = 0.86;
+      ring.scale.setScalar(1);
+    }
+  }
+
+  private beginRotationDraft(): void {
+    if (!this.editableMesh || !this.sculptEngine || this.rotationDraftBasePositions) {
+      return;
+    }
+
+    const boundsCenter = this.editableMesh.geometry.boundingSphere?.center ?? new Vector3();
+    const boundsRadius = this.editableMesh.geometry.boundingSphere?.radius ?? this.editableMesh.boundsRadius;
+    this.rotationDraftAngles = { x: 0, y: 0, z: 0 };
+    this.rotationDraftBeforeSnapshot = this.captureSessionSnapshot();
+    this.rotationDraftBasePositions = this.editableMesh.positions.slice();
+    this.rotationDraftBaseReferencePositions = this.editableMesh.referencePositions.slice();
+    this.rotationDraftCenter = boundsCenter.clone();
+    this.rotationDraftRadius = Math.max(boundsRadius * 1.18, 1);
+    this.callbacks.onRotationDraftChange?.({ ...this.rotationDraftAngles });
+  }
+
+  private finishRotationDraft(commit: boolean): void {
+    this.finishRotationDrag();
+    if (!this.rotationDraftBasePositions) {
+      return;
+    }
+
+    const beforeSnapshot = this.rotationDraftBeforeSnapshot;
+    const didRotate =
+      Math.abs(this.rotationDraftAngles.x) > 0.0005 ||
+      Math.abs(this.rotationDraftAngles.y) > 0.0005 ||
+      Math.abs(this.rotationDraftAngles.z) > 0.0005;
+    this.rotationDraftBeforeSnapshot = null;
+    this.rotationDraftBasePositions = null;
+    this.rotationDraftBaseReferencePositions = null;
+    this.rotationDraftCenter = null;
+    this.rotationDraftRadius = 1;
+    this.rotationDraftAngles = { x: 0, y: 0, z: 0 };
+
+    if (commit && didRotate && beforeSnapshot) {
+      const afterSnapshot = this.captureSessionSnapshot();
+      this.pushHistoryAction({
+        kind: 'session',
+        before: beforeSnapshot,
+        after: afterSnapshot,
+      });
+      this.emitHistory();
+      return;
+    }
+
+    if (!commit && beforeSnapshot) {
+      this.applySessionSnapshot(beforeSnapshot, this.captureViewState());
+    }
+  }
+
+  private applyRotationDraft(): void {
+    if (
+      !this.editableMesh ||
+      !this.rotationDraftBasePositions ||
+      !this.rotationDraftBaseReferencePositions ||
+      !this.rotationDraftCenter
+    ) {
+      return;
+    }
+
+    rotatePositionsEulerInto(
+      this.rotationDraftBasePositions,
+      this.editableMesh.positions,
+      this.rotationDraftAngles,
+      this.rotationDraftCenter,
+    );
+    rotatePositionsEulerInto(
+      this.rotationDraftBaseReferencePositions,
+      this.editableMesh.referencePositions,
+      this.rotationDraftAngles,
+      this.rotationDraftCenter,
+    );
+    this.afterRigidGeometryTransform();
+  }
+
+  private getRotationPlaneVectorFromPointer(axis: MeshRotationAxis): Vector3 | null {
+    const center = this.rotationDraftCenter ?? new Vector3();
+    const normal = getRotationAxisVector(axis);
+    this.raycaster.setFromCamera(this.pointerNdc, this.camera);
+    const denominator = normal.dot(this.raycaster.ray.direction);
+    if (Math.abs(denominator) <= 1e-5) {
+      return null;
+    }
+
+    const distance = normal.dot(center.clone().sub(this.raycaster.ray.origin)) / denominator;
+    if (!Number.isFinite(distance)) {
+      return null;
+    }
+
+    const point = this.raycaster.ray.origin
+      .clone()
+      .addScaledVector(this.raycaster.ray.direction, distance);
+    const vector = point.sub(center);
+    vector.addScaledVector(normal, -vector.dot(normal));
+    if (vector.lengthSq() <= 1e-8) {
+      return null;
+    }
+
+    return vector.normalize();
+  }
+
+  private afterRigidGeometryTransform(): void {
+    if (!this.editableMesh) {
+      return;
+    }
+
+    recomputeAllNormals(
+      this.editableMesh.positions,
+      this.editableMesh.indices,
+      this.editableMesh.faceNormals,
+      this.editableMesh.normals,
+      this.editableMesh.vertexFaceOffsets,
+      this.editableMesh.vertexFaces,
+    );
+    recomputeDisplacementColorsRange(
+      this.editableMesh.positions,
+      this.editableMesh.referencePositions,
+      this.editableMesh.normals,
+      this.editableMesh.colors,
+      0,
+      this.editableMesh.vertexCount,
+    );
+    this.editableMesh.positionAttribute.needsUpdate = true;
+    this.editableMesh.normalAttribute.needsUpdate = true;
+    this.editableMesh.colorAttribute.needsUpdate = true;
+    this.editableMesh.geometry.computeBoundingBox();
+    this.editableMesh.geometry.computeBoundingSphere();
+    this.editableMesh.boundsRadius =
+      this.editableMesh.geometry.boundingSphere?.radius ?? this.editableMesh.boundsRadius;
+    (
+      this.editableMesh.geometry as BufferGeometry & {
+        boundsTree?: { refit?: () => void };
+      }
+    ).boundsTree?.refit?.();
+
+    if (this.activeBoundaryVertexIds) {
+      this.boundaryGuide = captureBoundaryGuide(this.editableMesh.positions, this.activeBoundaryVertexIds);
+    }
+
+    this.updateRotationOverlayScale();
+    this.rebuildMeasurements();
+    this.emitMeshStats();
+  }
+
+  private ensureRotationOverlay(): void {
+    if (this.rotationOverlay) {
+      return;
+    }
+
+    const overlay = new Group();
+    overlay.visible = false;
+    overlay.renderOrder = 10;
+
+    const plane = new Mesh(
+      new PlaneGeometry(2, 2),
+      new MeshBasicMaterial({
+        color: '#8aa0b5',
+        transparent: true,
+        opacity: 0.12,
+        side: DoubleSide,
+        depthWrite: false,
+      }),
+    );
+    plane.renderOrder = 1;
+    overlay.add(plane);
+
+    const grid = new GridHelper(2, 12, '#728196', '#b4bec8');
+    grid.rotation.x = Math.PI / 2;
+    grid.renderOrder = 2;
+    const gridMaterial = Array.isArray(grid.material) ? grid.material : [grid.material];
+    for (const material of gridMaterial) {
+      material.transparent = true;
+      material.opacity = 0.38;
+      material.depthWrite = false;
+    }
+    overlay.add(grid);
+
+    const xRing = this.createRotationRing('#d14646', 'x');
+    xRing.rotation.y = Math.PI / 2;
+    const yRing = this.createRotationRing('#2f9b62', 'y');
+    yRing.rotation.x = Math.PI / 2;
+    const zRing = this.createRotationRing('#2f6eea', 'z');
+    this.rotationRings = [xRing, yRing, zRing];
+    overlay.add(xRing, yRing, zRing);
+
+    this.rotationOverlay = overlay;
+    this.scene.add(overlay);
+  }
+
+  private createRotationRing(
+    color: string,
+    axis: MeshRotationAxis,
+  ): Mesh {
+    const ring = new Mesh(
+      new TorusGeometry(1, 0.012, 10, 128),
+      new MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity: 0.86,
+        depthTest: false,
+        depthWrite: false,
+      }),
+    );
+    ring.userData.axis = axis;
+    ring.userData.baseColor = color;
+    ring.renderOrder = 11;
+    return ring;
+  }
+
+  private updateRotationOverlayScale(): void {
+    if (!this.rotationOverlay || !this.editableMesh) {
+      return;
+    }
+
+    const radius =
+      this.rotationDraftBasePositions && this.rotationDraftCenter
+        ? this.rotationDraftRadius
+        : Math.max(this.editableMesh.boundsRadius * 1.18, 1);
+    const center =
+      this.rotationDraftBasePositions && this.rotationDraftCenter
+        ? this.rotationDraftCenter
+        : (this.editableMesh.geometry.boundingSphere?.center ?? new Vector3());
+    this.rotationOverlay.position.copy(center);
+    this.rotationOverlay.scale.setScalar(radius);
   }
 
   private resize(): void {
@@ -2431,6 +3480,7 @@ export class ViewportController {
     this.overlayCanvas.style.height = `${height}px`;
     this.overlayContext.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
     this.updateHoleLoopMaterialResolution(width, height);
+    this.updateMeasurementMaterialResolution(width, height);
   }
 
   private captureViewState(): ViewState {
@@ -2447,7 +3497,7 @@ export class ViewportController {
     editable: EditableMeshData,
     guide: Float32Array,
   ): Uint32Array | null {
-    const loops = buildHoleLoopSet(editable.indices).loops;
+    const loops = buildOpenBoundaryLoopCandidates(editable.indices, editable.referencePositions);
     let bestLoop: Uint32Array | null = null;
     let bestScore = Infinity;
 
@@ -2457,7 +3507,35 @@ export class ViewportController {
         continue;
       }
 
-      const score = this.scoreBoundaryLoopAgainstGuide(
+      const centerScore = this.scoreBoundaryLoopCenterAgainstGuide(
+        editable.positions,
+        loop.orderedVertexIds,
+        guide,
+      );
+      const pathScore = this.scoreBoundaryLoopAgainstGuide(
+        editable.positions,
+        loop.orderedVertexIds,
+        guide,
+      );
+      const score = centerScore + pathScore * 0.001;
+      if (score < bestScore) {
+        bestScore = score;
+        bestLoop = loop.orderedVertexIds;
+      }
+    }
+
+    if (bestLoop) {
+      return bestLoop.slice();
+    }
+
+    const visibleLoops = buildHoleLoopSet(editable.indices, editable.referencePositions).loops;
+    for (let i = 0; i < visibleLoops.length; i += 1) {
+      const loop = visibleLoops[i];
+      if (!loop.isBoundaryLoop || !loop.orderedVertexIds) {
+        continue;
+      }
+
+      const score = this.scoreBoundaryLoopCenterAgainstGuide(
         editable.positions,
         loop.orderedVertexIds,
         guide,
@@ -2604,6 +3682,48 @@ export class ViewportController {
     return score * loopInvCount + (centroidDx * centroidDx + centroidDy * centroidDy + centroidDz * centroidDz);
   }
 
+  private scoreBoundaryLoopCenterAgainstGuide(
+    positions: ArrayLike<number>,
+    orderedVertexIds: Uint32Array,
+    guide: Float32Array,
+  ): number {
+    if (orderedVertexIds.length === 0 || guide.length < 3) {
+      return Infinity;
+    }
+
+    let guideCentroidX = 0;
+    let guideCentroidY = 0;
+    let guideCentroidZ = 0;
+    for (let i = 0; i < guide.length; i += 3) {
+      guideCentroidX += guide[i];
+      guideCentroidY += guide[i + 1];
+      guideCentroidZ += guide[i + 2];
+    }
+    const guideInvCount = 1 / (guide.length / 3);
+    guideCentroidX *= guideInvCount;
+    guideCentroidY *= guideInvCount;
+    guideCentroidZ *= guideInvCount;
+
+    let loopCentroidX = 0;
+    let loopCentroidY = 0;
+    let loopCentroidZ = 0;
+    for (let i = 0; i < orderedVertexIds.length; i += 1) {
+      const offset = orderedVertexIds[i] * 3;
+      loopCentroidX += positions[offset];
+      loopCentroidY += positions[offset + 1];
+      loopCentroidZ += positions[offset + 2];
+    }
+    const loopInvCount = 1 / orderedVertexIds.length;
+    loopCentroidX *= loopInvCount;
+    loopCentroidY *= loopInvCount;
+    loopCentroidZ *= loopInvCount;
+
+    const dx = loopCentroidX - guideCentroidX;
+    const dy = loopCentroidY - guideCentroidY;
+    const dz = loopCentroidZ - guideCentroidZ;
+    return dx * dx + dy * dy + dz * dz;
+  }
+
   private pointToGuideDistanceSq(x: number, y: number, z: number, guide: Float32Array): number {
     let bestDistanceSq = Infinity;
 
@@ -2679,7 +3799,7 @@ export class ViewportController {
       throw new Error('The requested boundary preview snapshot is missing mesh arrays.');
     }
 
-    const geometry = createGeometryFromMeshArrays(snapshot.positions, snapshot.indices);
+    const geometry = createGeometryFromMeshArrays(snapshot.positions, snapshot.indices, snapshot.uvs);
     geometry.computeBoundsTree({
       maxLeafSize: 20,
       setBoundingBox: false,
@@ -2691,6 +3811,29 @@ export class ViewportController {
     const engine = new SculptEngine(editable, SCULPT_HISTORY_LIMIT);
     engine.importHistorySnapshot(snapshot.history);
     return { editable, engine };
+  }
+
+  private installAutomatedGeometry(
+    geometry: BufferGeometry,
+    viewState: ViewState,
+  ): EditableMeshData {
+    const weldedGeometry = weldGeometryByDistance(geometry) as BufferGeometry & {
+      computeBoundsTree?: (options?: { maxLeafSize?: number; setBoundingBox?: boolean; indirect?: boolean }) => unknown;
+    };
+    weldedGeometry.computeBoundsTree?.({
+      maxLeafSize: 20,
+      setBoundingBox: false,
+      indirect: true,
+    });
+    const editable = createEditableMeshData(weldedGeometry);
+    const engine = new SculptEngine(editable, SCULPT_HISTORY_LIMIT);
+    this.installSession(editable, engine, {
+      sessionId: this.allocateSessionId(),
+      resetActionHistory: false,
+      resetView: false,
+    });
+    this.restoreViewState(viewState);
+    return editable;
   }
 
   private restoreBoundarySessionState(state: BoundarySessionState): void {
@@ -2739,9 +3882,11 @@ export class ViewportController {
       positions: this.editableMesh.positions.slice(),
       indices: this.editableMesh.indices.slice(),
       referencePositions: this.editableMesh.referencePositions.slice(),
+      uvs: copyGeometryUvs(this.editableMesh.geometry),
       history: this.sculptEngine.exportHistorySnapshot(),
       selectedTriangleMask: this.selectedTriangleMask?.slice() ?? new Uint8Array(this.editableMesh.triangleCount),
       selectedTriangleCount: this.selectedTriangleCount,
+      faceMaterialIndices: this.faceMaterialIndices?.slice() ?? null,
     };
   }
 
@@ -2755,9 +3900,11 @@ export class ViewportController {
       positions: editable.positions.slice(),
       indices: editable.indices.slice(),
       referencePositions: editable.referencePositions.slice(),
+      uvs: copyGeometryUvs(editable.geometry),
       history: engine.exportHistorySnapshot(),
       selectedTriangleMask: new Uint8Array(editable.triangleCount),
       selectedTriangleCount: 0,
+      faceMaterialIndices: null,
     };
   }
 
@@ -2771,7 +3918,7 @@ export class ViewportController {
       return;
     }
 
-    const geometry = createGeometryFromMeshArrays(snapshot.positions, snapshot.indices);
+    const geometry = createGeometryFromMeshArrays(snapshot.positions, snapshot.indices, snapshot.uvs);
     geometry.computeBoundsTree({
       maxLeafSize: 20,
       setBoundingBox: false,
@@ -2789,6 +3936,7 @@ export class ViewportController {
       resetView: false,
       selectedTriangleMask: snapshot.selectedTriangleMask,
       selectedTriangleCount: snapshot.selectedTriangleCount,
+      faceMaterialIndices: snapshot.faceMaterialIndices,
     });
     this.restoreViewState(viewState);
   }
@@ -2825,6 +3973,146 @@ export class ViewportController {
 
     if (this.holeHoverOverlay) {
       this.updateSingleLineMaterialResolution(this.holeHoverOverlay.material as LineMaterial, width, height);
+    }
+  }
+
+  private updateMeasurementMaterialResolution(width: number, height: number): void {
+    if (this.measurementOverlay) {
+      this.updateSingleLineMaterialResolution(this.measurementOverlay.material as LineMaterial, width, height);
+    }
+
+    if (this.measurementHeightOverlay) {
+      this.updateSingleLineMaterialResolution(
+        this.measurementHeightOverlay.material as LineMaterial,
+        width,
+        height,
+      );
+    }
+  }
+
+  private rebuildMeasurements(): void {
+    if (!this.editableMesh) {
+      this.measurementState = createEmptyMeasurementState();
+      this.updateMeasurementOverlayVisibility();
+      this.emitMeasurements();
+      return;
+    }
+
+    const bounds = computeAxisBoundsY(this.editableMesh.positions);
+    this.measurementDistalY = bounds.minY;
+    const totalHeightMm = Math.max(bounds.maxY - bounds.minY, 0);
+    const rows: MeasurementState['rows'] = [];
+    const overlayPositions: number[] = [];
+
+    for (let distance = MEASUREMENT_SPACING_MM; distance < totalHeightMm - 1e-4; distance += MEASUREMENT_SPACING_MM) {
+      const y = bounds.minY + distance;
+      const section = computeSectionSegmentsAtY(this.editableMesh.positions, this.editableMesh.indices, y);
+      if (section.circumferenceMm <= 1e-3) {
+        continue;
+      }
+
+      rows.push({
+        distanceFromDistalMm: distance,
+        circumferenceMm: section.circumferenceMm,
+      });
+      overlayPositions.push(...section.positions);
+    }
+
+    this.measurementState = {
+      rows,
+      totalHeightMm,
+      clickedHeightMm:
+        this.measurementState.clickedHeightMm === null
+          ? null
+          : Math.min(Math.max(this.measurementState.clickedHeightMm, 0), totalHeightMm),
+    };
+
+    if (this.measurementOverlayGeometry) {
+      this.measurementOverlayGeometry.setPositions(
+        overlayPositions.length > 0 ? new Float32Array(overlayPositions) : new Float32Array(0),
+      );
+    }
+
+    this.rebuildMeasurementHeightOverlay();
+    this.updateMeasurementOverlayVisibility();
+    this.emitMeasurements();
+  }
+
+  private measureHeightAtPointer(): boolean {
+    if (!this.mesh || !this.editableMesh) {
+      return false;
+    }
+
+    this.raycaster.setFromCamera(this.pointerNdc, this.camera);
+    const hit = this.raycaster.intersectObject(this.mesh, false)[0];
+    if (!hit) {
+      return false;
+    }
+
+    this.localHitPoint.copy(hit.point);
+    this.mesh.worldToLocal(this.localHitPoint);
+    const clickedHeightMm = Math.min(
+      Math.max(this.localHitPoint.y - this.measurementDistalY, 0),
+      this.measurementState.totalHeightMm,
+    );
+    this.measurementState = {
+      ...this.measurementState,
+      clickedHeightMm,
+    };
+    this.measurementHeightPoint = this.localHitPoint.clone();
+    this.rebuildMeasurementHeightOverlay();
+    this.emitMeasurements();
+    this.callbacks.onMeasurementCaptured?.(clickedHeightMm);
+    return true;
+  }
+
+  private rebuildMeasurementHeightOverlay(): void {
+    if (!this.measurementHeightOverlayGeometry || !this.editableMesh) {
+      return;
+    }
+
+    if (!this.measurementHeightPoint || this.measurementState.clickedHeightMm === null) {
+      this.measurementHeightOverlayGeometry.setPositions(new Float32Array(0));
+      this.updateMeasurementOverlayVisibility();
+      return;
+    }
+
+    const hitPoint = this.measurementHeightPoint;
+    this.measurementHeightOverlayGeometry.setPositions(
+      new Float32Array([
+        hitPoint.x,
+        this.measurementDistalY,
+        hitPoint.z,
+        hitPoint.x,
+        hitPoint.y,
+        hitPoint.z,
+      ]),
+    );
+    this.updateMeasurementOverlayVisibility();
+  }
+
+  private resetMeasurementForModelAction(): void {
+    if (!this.measurementCircumferenceVisible && !this.measurementPickActive) {
+      return;
+    }
+
+    this.measurementCircumferenceVisible = false;
+    this.cancelMeasurementPick();
+    this.clearMeasurementHeight();
+    this.updateMeasurementOverlayVisibility();
+    this.callbacks.onMeasurementVisibilityChange?.(false);
+    this.emitMeasurements();
+  }
+
+  private updateMeasurementOverlayVisibility(): void {
+    const visible = this.editableMesh !== null;
+    if (this.measurementOverlay) {
+      this.measurementOverlay.visible =
+        visible && this.measurementCircumferenceVisible && this.measurementState.rows.length > 0;
+    }
+
+    if (this.measurementHeightOverlay) {
+      this.measurementHeightOverlay.visible = visible && this.measurementState.clickedHeightMm !== null;
     }
   }
 
@@ -2865,6 +4153,10 @@ export class ViewportController {
     });
   }
 
+  private emitMeasurements(): void {
+    this.callbacks.onMeasurementChange?.(this.getMeasurementState());
+  }
+
   private rebuildHoleLoopOverlays(): HoleLoopSummary {
     this.clearHoleLoopOverlays();
 
@@ -2876,7 +4168,7 @@ export class ViewportController {
       };
     }
 
-    const holeLoopSet = buildHoleLoopSet(this.editableMesh.indices);
+    const holeLoopSet = buildHoleLoopSet(this.editableMesh.indices, this.editableMesh.referencePositions);
     this.holeLoops = holeLoopSet.loops;
     this.hoveredHoleLoopIndex = -1;
 
@@ -2926,7 +4218,7 @@ export class ViewportController {
   }
 
   private updateHoleLoopOverlayVisibility(): void {
-    const visible = this.holeFillMode && this.holeLoops.length > 0;
+    const visible = this.holeFillMode && !this.rotationOverlayVisible && this.holeLoops.length > 0;
     if (this.holeLoopOverlay) {
       this.holeLoopOverlay.visible = visible;
     }
@@ -2942,6 +4234,7 @@ export class ViewportController {
   private updateHoleLoopHover(): void {
     if (
       !this.holeFillMode ||
+      this.rotationOverlayVisible ||
       !this.editableMesh ||
       !this.mesh ||
       !this.pointerInside ||
@@ -3025,7 +4318,7 @@ export class ViewportController {
       return;
     }
 
-    if (!this.holeFillMode || this.holeLoops.length === 0) {
+    if (!this.holeFillMode || this.rotationOverlayVisible || this.holeLoops.length === 0) {
       this.holeLoopOverlayGeometry.setPositions(new Float32Array(0));
       this.holeLoopOverlay.visible = false;
       return;
@@ -3034,7 +4327,7 @@ export class ViewportController {
     this.holeLoopOverlayGeometry.setPositions(
       createLoopSegmentPositionArray(this.editableMesh.positions, this.holeLoops),
     );
-    this.holeLoopOverlay.visible = this.holeLoops.length > 0;
+    this.holeLoopOverlay.visible = this.holeLoops.length > 0 && !this.rotationOverlayVisible;
   }
 
   private updateHoleHoverOverlay(): void {
@@ -3048,7 +4341,7 @@ export class ViewportController {
         : this.activeBoundaryLoopIndex >= 0
           ? this.activeBoundaryLoopIndex
           : -1;
-    if (!this.holeFillMode || highlightIndex < 0 || !this.holeLoops[highlightIndex]) {
+    if (this.rotationOverlayVisible || !this.holeFillMode || highlightIndex < 0 || !this.holeLoops[highlightIndex]) {
       this.holeHoverOverlay.visible = false;
       this.holeHoverOverlayGeometry.setPositions(new Float32Array(0));
       return;
@@ -3098,7 +4391,11 @@ export class ViewportController {
       return false;
     }
 
-    const fillMesh = createHoleFillMesh(this.editableMesh.positions, this.editableMesh.indices);
+    const fillMesh = createHoleFillMesh(
+      this.editableMesh.positions,
+      this.editableMesh.indices,
+      this.editableMesh.referencePositions,
+    );
     this.debugHoleFill('fill-kernel-start', {
       orderedVertexCount: loop.orderedVertexIds.length,
     });
@@ -3128,7 +4425,18 @@ export class ViewportController {
       fillMesh.positions,
       this.editableMesh.vertexCount,
     );
-    const geometry = createGeometryFromMeshArrays(fillMesh.positions, fillMesh.indices);
+    const fillUvs = createHoleFillUvs(
+      copyGeometryUvs(this.editableMesh.geometry),
+      fillMesh.positions,
+      result.patch?.boundaryVertexIds ?? Array.from(loop.orderedVertexIds),
+      result.patch?.newVertexIds ?? [],
+    );
+    const geometry = createGeometryFromMeshArrays(fillMesh.positions, fillMesh.indices, fillUvs);
+    const fillFaceMaterialIndices = createHoleFillFaceMaterialIndices(
+      this.faceMaterialIndices,
+      this.editableMesh.triangleCount,
+      fillMesh.indices.length / 3,
+    );
     geometry.computeBoundsTree({
       maxLeafSize: 20,
       setBoundingBox: false,
@@ -3147,9 +4455,11 @@ export class ViewportController {
       positions: editable.positions.slice(),
       indices: editable.indices.slice(),
       referencePositions: editable.referencePositions.slice(),
+      uvs: copyGeometryUvs(editable.geometry),
       history: engine.exportHistorySnapshot(),
       selectedTriangleMask: new Uint8Array(editable.triangleCount),
       selectedTriangleCount: 0,
+      faceMaterialIndices: fillFaceMaterialIndices,
     } satisfies SessionSnapshot;
     this.pushHistoryAction({
       kind: 'session',
@@ -3160,6 +4470,7 @@ export class ViewportController {
       sessionId: nextSessionId,
       resetActionHistory: false,
       resetView: false,
+      faceMaterialIndices: fillFaceMaterialIndices,
     });
     this.restoreViewState(viewState);
     this.debugHoleFill('fill-session-updated', {
@@ -3191,7 +4502,7 @@ export class ViewportController {
       return;
     }
 
-    if (this.holeFillMode) {
+    if (this.holeFillMode || this.rotationOverlayVisible) {
       this.cursor.visible = false;
       return;
     }
@@ -3243,7 +4554,7 @@ export class ViewportController {
     }
 
     this.selectionOverlayGeometry.setIndex(new BufferAttribute(indexArray, 1));
-    this.selectionOverlay.visible = selectedTriangleCount > 0;
+    this.selectionOverlay.visible = selectedTriangleCount > 0 && !this.rotationOverlayVisible;
     this.selectionDirty = false;
   }
 
@@ -3319,7 +4630,12 @@ export class ViewportController {
     this.activeBoundaryLoopIndex = -1;
   }
 
-  private clearSceneMesh(): void {
+  private clearSceneMesh(disposeTexture = true): void {
+    this.finishRotationDraft(false);
+    if (this.rotationOverlay) {
+      this.rotationOverlay.visible = false;
+    }
+
     if (this.cursor) {
       this.cursor.removeFromParent();
       this.cursor.geometry.dispose();
@@ -3335,14 +4651,36 @@ export class ViewportController {
       this.selectionOverlayGeometry = null;
     }
 
+    if (this.measurementOverlay) {
+      this.measurementOverlay.removeFromParent();
+      this.measurementOverlayGeometry?.dispose();
+      (this.measurementOverlay.material as LineMaterial).dispose();
+      this.measurementOverlay = null;
+      this.measurementOverlayGeometry = null;
+    }
+
+    if (this.measurementHeightOverlay) {
+      this.measurementHeightOverlay.removeFromParent();
+      this.measurementHeightOverlayGeometry?.dispose();
+      (this.measurementHeightOverlay.material as LineMaterial).dispose();
+      this.measurementHeightOverlay = null;
+      this.measurementHeightOverlayGeometry = null;
+    }
+
     this.clearHoleLoopOverlays();
 
     if (this.mesh) {
       this.mesh.geometry.dispose();
       this.mesh.removeFromParent();
-      this.meshMaterial?.dispose();
+      disposeMaterial(this.meshMaterial);
+      if (disposeTexture) {
+        this.meshTexture?.dispose();
+      }
       this.mesh = null;
       this.meshMaterial = null;
+      if (disposeTexture) {
+        this.meshTexture = null;
+      }
     }
 
     this.editableMesh = null;
@@ -3350,8 +4688,399 @@ export class ViewportController {
     this.hoverHit = null;
     this.selectedTriangleMask = null;
     this.selectedTriangleCount = 0;
+    this.faceMaterialIndices = null;
+    this.measurementState = createEmptyMeasurementState();
+    this.measurementDistalY = 0;
+    this.measurementHeightPoint = null;
+    if (this.measurementPickActive) {
+      this.measurementPickActive = false;
+      this.callbacks.onMeasurementPickStateChange?.(false);
+    }
+    this.emitMeasurements();
     this.selectionDirty = false;
   }
+
+  private disposeRotationOverlay(): void {
+    if (!this.rotationOverlay) {
+      return;
+    }
+
+    this.setHoveredRotationRing(null);
+    this.rotationOverlay.removeFromParent();
+    this.rotationOverlay.traverse((object) => {
+      if (object instanceof Mesh) {
+        object.geometry.dispose();
+        disposeMaterial(object.material);
+      } else if (object instanceof GridHelper) {
+        object.geometry.dispose();
+        disposeMaterial(object.material);
+      }
+    });
+    this.rotationOverlay = null;
+    this.rotationRings = [];
+    this.rotationHoveredRing = null;
+  }
+}
+
+function disposeMaterial(material: Material | Material[] | null): void {
+  if (Array.isArray(material)) {
+    for (let i = 0; i < material.length; i += 1) {
+      material[i].dispose();
+    }
+    return;
+  }
+
+  material?.dispose();
+}
+
+function createEmptyMeasurementState(): MeasurementState {
+  return {
+    rows: [],
+    totalHeightMm: 0,
+    clickedHeightMm: null,
+  };
+}
+
+function rotatePositionsEulerInto(
+  source: Float32Array,
+  target: Float32Array,
+  angles: Record<MeshRotationAxis, number>,
+  center: Vector3,
+): void {
+  const rx = angles.x * Math.PI / 180;
+  const ry = angles.y * Math.PI / 180;
+  const rz = angles.z * Math.PI / 180;
+  const cosX = Math.cos(rx);
+  const sinX = Math.sin(rx);
+  const cosY = Math.cos(ry);
+  const sinY = Math.sin(ry);
+  const cosZ = Math.cos(rz);
+  const sinZ = Math.sin(rz);
+
+  for (let offset = 0; offset < source.length; offset += 3) {
+    let x = source[offset] - center.x;
+    let y = source[offset + 1] - center.y;
+    let z = source[offset + 2] - center.z;
+
+    const yAfterX = y * cosX - z * sinX;
+    const zAfterX = y * sinX + z * cosX;
+    y = yAfterX;
+    z = zAfterX;
+
+    const xAfterY = x * cosY + z * sinY;
+    const zAfterY = -x * sinY + z * cosY;
+    x = xAfterY;
+    z = zAfterY;
+
+    const xAfterZ = x * cosZ - y * sinZ;
+    const yAfterZ = x * sinZ + y * cosZ;
+    target[offset] = xAfterZ + center.x;
+    target[offset + 1] = yAfterZ + center.y;
+    target[offset + 2] = z + center.z;
+  }
+}
+
+function getRotationAxisVector(axis: MeshRotationAxis): Vector3 {
+  if (axis === 'x') {
+    return new Vector3(1, 0, 0);
+  }
+  if (axis === 'y') {
+    return new Vector3(0, 1, 0);
+  }
+  return new Vector3(0, 0, 1);
+}
+
+function signedAngleDegrees(from: Vector3, to: Vector3, axis: Vector3): number {
+  const cross = from.clone().cross(to);
+  const sin = axis.dot(cross);
+  const cos = Math.min(Math.max(from.dot(to), -1), 1);
+  return Math.atan2(sin, cos) * 180 / Math.PI;
+}
+
+function computeHighestZ(
+  positions: Float32Array,
+  vertexIds: Uint32Array,
+): number {
+  let maxZ = Number.NEGATIVE_INFINITY;
+  for (let i = 0; i < vertexIds.length; i += 1) {
+    const offset = vertexIds[i] * 3;
+    maxZ = Math.max(maxZ, positions[offset + 2]);
+  }
+
+  return Number.isFinite(maxZ) ? maxZ : 0;
+}
+
+function computeAxisBoundsY(positions: Float32Array): { minY: number; maxY: number } {
+  let minY = Number.POSITIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  for (let offset = 1; offset < positions.length; offset += 3) {
+    minY = Math.min(minY, positions[offset]);
+    maxY = Math.max(maxY, positions[offset]);
+  }
+
+  if (!Number.isFinite(minY) || !Number.isFinite(maxY)) {
+    return { minY: 0, maxY: 0 };
+  }
+
+  return { minY, maxY };
+}
+
+function computeSectionSegmentsAtY(
+  positions: Float32Array,
+  indices: Uint32Array,
+  y: number,
+): { circumferenceMm: number; positions: number[] } {
+  const segmentPositions: number[] = [];
+  let circumferenceMm = 0;
+
+  for (let triangle = 0; triangle < indices.length / 3; triangle += 1) {
+    const triOffset = triangle * 3;
+    const intersections = collectTrianglePlaneIntersectionsY(
+      positions,
+      indices[triOffset],
+      indices[triOffset + 1],
+      indices[triOffset + 2],
+      y,
+    );
+    if (intersections.length < 2) {
+      continue;
+    }
+
+    const pair = pickLongestPointPair(intersections);
+    if (!pair) {
+      continue;
+    }
+
+    const [a, b] = pair;
+    const length = a.distanceTo(b);
+    if (length <= 1e-5) {
+      continue;
+    }
+
+    circumferenceMm += length;
+    segmentPositions.push(a.x, a.y, a.z, b.x, b.y, b.z);
+  }
+
+  return { circumferenceMm, positions: segmentPositions };
+}
+
+function collectTrianglePlaneIntersectionsY(
+  positions: Float32Array,
+  a: number,
+  b: number,
+  c: number,
+  y: number,
+): Vector3[] {
+  const vertices = [
+    new Vector3(positions[a * 3], positions[a * 3 + 1], positions[a * 3 + 2]),
+    new Vector3(positions[b * 3], positions[b * 3 + 1], positions[b * 3 + 2]),
+    new Vector3(positions[c * 3], positions[c * 3 + 1], positions[c * 3 + 2]),
+  ];
+  const intersections: Vector3[] = [];
+  const seen = new Set<string>();
+  for (let edge = 0; edge < 3; edge += 1) {
+    const start = vertices[edge];
+    const end = vertices[(edge + 1) % 3];
+    const startDistance = start.y - y;
+    const endDistance = end.y - y;
+    if (Math.abs(startDistance) <= 1e-7 && Math.abs(endDistance) <= 1e-7) {
+      continue;
+    }
+
+    if (startDistance * endDistance > 0) {
+      continue;
+    }
+
+    const denominator = start.y - end.y;
+    if (Math.abs(denominator) <= 1e-10) {
+      continue;
+    }
+
+    const t = (start.y - y) / denominator;
+    if (t < -1e-7 || t > 1 + 1e-7) {
+      continue;
+    }
+
+    const point = new Vector3().lerpVectors(start, end, Math.min(Math.max(t, 0), 1));
+    point.y = y;
+    const key = `${point.x.toFixed(5)},${point.y.toFixed(5)},${point.z.toFixed(5)}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    intersections.push(point);
+  }
+
+  return intersections;
+}
+
+function pickLongestPointPair(points: Vector3[]): [Vector3, Vector3] | null {
+  let bestPair: [Vector3, Vector3] | null = null;
+  let bestDistanceSq = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    for (let j = i + 1; j < points.length; j += 1) {
+      const distanceSq = points[i].distanceToSquared(points[j]);
+      if (distanceSq > bestDistanceSq) {
+        bestDistanceSq = distanceSq;
+        bestPair = [points[i], points[j]];
+      }
+    }
+  }
+
+  return bestPair;
+}
+
+interface ObjSerializationOptions {
+  objectName: string;
+  materialFilename: string;
+  positions: Float32Array;
+  indices: Uint32Array;
+  uvs: Float32Array | null;
+  faceMaterialIndices: Uint8Array | null;
+  scanMaterialName: string;
+  fillMaterialName: string;
+}
+
+interface MtlSerializationOptions {
+  scanMaterialName: string;
+  fillMaterialName: string;
+  textureFilename: string | null;
+}
+
+function serializeAsciiStl(name: string, positions: Float32Array, indices: Uint32Array): string {
+  const lines = [`solid ${name}`];
+  for (let triangle = 0; triangle < indices.length / 3; triangle += 1) {
+    const triOffset = triangle * 3;
+    const a = indices[triOffset];
+    const b = indices[triOffset + 1];
+    const c = indices[triOffset + 2];
+    const normal = computeFacetNormal(positions, a, b, c);
+    lines.push(
+      `  facet normal ${formatExportNumber(normal.x)} ${formatExportNumber(normal.y)} ${formatExportNumber(normal.z)}`,
+      '    outer loop',
+      `      vertex ${formatVertex(positions, a)}`,
+      `      vertex ${formatVertex(positions, b)}`,
+      `      vertex ${formatVertex(positions, c)}`,
+      '    endloop',
+      '  endfacet',
+    );
+  }
+
+  lines.push(`endsolid ${name}`);
+  return `${lines.join('\n')}\n`;
+}
+
+function serializeObj(options: ObjSerializationOptions): string {
+  const { positions, indices, uvs, faceMaterialIndices } = options;
+  const vertexCount = positions.length / 3;
+  const hasUvs = Boolean(uvs && uvs.length >= vertexCount * 2);
+  const lines = [
+    '# Exported by NouraSoft',
+    `mtllib ${options.materialFilename}`,
+    `o ${options.objectName}`,
+  ];
+
+  for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+    lines.push(`v ${formatVertex(positions, vertex)}`);
+  }
+
+  if (hasUvs && uvs) {
+    for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+      const offset = vertex * 2;
+      lines.push(`vt ${formatExportNumber(uvs[offset])} ${formatExportNumber(uvs[offset + 1])}`);
+    }
+  }
+
+  let currentMaterial = '';
+  for (let triangle = 0; triangle < indices.length / 3; triangle += 1) {
+    const materialName =
+      faceMaterialIndices?.[triangle] === 1 ? options.fillMaterialName : options.scanMaterialName;
+    if (materialName !== currentMaterial) {
+      lines.push(`usemtl ${materialName}`);
+      currentMaterial = materialName;
+    }
+
+    const triOffset = triangle * 3;
+    const a = indices[triOffset] + 1;
+    const b = indices[triOffset + 1] + 1;
+    const c = indices[triOffset + 2] + 1;
+    lines.push(
+      hasUvs
+        ? `f ${a}/${a} ${b}/${b} ${c}/${c}`
+        : `f ${a} ${b} ${c}`,
+    );
+  }
+
+  return `${lines.join('\n')}\n`;
+}
+
+function serializeMtl(options: MtlSerializationOptions): string {
+  const lines = [
+    '# Exported by NouraSoft',
+    `newmtl ${options.scanMaterialName}`,
+    'Ka 1.000000 1.000000 1.000000',
+    'Kd 1.000000 1.000000 1.000000',
+    'Ks 0.000000 0.000000 0.000000',
+    'd 1.000000',
+    'illum 2',
+  ];
+
+  if (options.textureFilename) {
+    lines.push(`map_Kd ${options.textureFilename}`);
+  }
+
+  lines.push(
+    '',
+    `newmtl ${options.fillMaterialName}`,
+    'Ka 0.850000 0.870000 0.900000',
+    'Kd 0.850000 0.870000 0.900000',
+    'Ks 0.000000 0.000000 0.000000',
+    'd 1.000000',
+    'illum 2',
+  );
+
+  return `${lines.join('\n')}\n`;
+}
+
+function computeFacetNormal(positions: Float32Array, a: number, b: number, c: number): Vector3 {
+  const ax = positions[a * 3];
+  const ay = positions[a * 3 + 1];
+  const az = positions[a * 3 + 2];
+  const bx = positions[b * 3];
+  const by = positions[b * 3 + 1];
+  const bz = positions[b * 3 + 2];
+  const cx = positions[c * 3];
+  const cy = positions[c * 3 + 1];
+  const cz = positions[c * 3 + 2];
+
+  const normal = new Vector3(
+    (by - ay) * (cz - az) - (bz - az) * (cy - ay),
+    (bz - az) * (cx - ax) - (bx - ax) * (cz - az),
+    (bx - ax) * (cy - ay) - (by - ay) * (cx - ax),
+  );
+  if (normal.lengthSq() <= 1e-16) {
+    return normal.set(0, 0, 0);
+  }
+
+  return normal.normalize();
+}
+
+function formatVertex(positions: Float32Array, vertex: number): string {
+  const offset = vertex * 3;
+  return `${formatExportNumber(positions[offset])} ${formatExportNumber(positions[offset + 1])} ${formatExportNumber(
+    positions[offset + 2],
+  )}`;
+}
+
+function formatExportNumber(value: number): string {
+  return Number.isFinite(value) ? Number(value.toFixed(6)).toString() : '0';
+}
+
+function sanitizeExportName(name: string): string {
+  const withoutExtension = name.replace(/\.[^.\\/]+$/, '');
+  const sanitized = withoutExtension.replace(/[<>:"/\\|?*\u0000-\u001f]+/g, '_').trim();
+  return sanitized || 'NouraSoft_export';
 }
 
 function floatArraysEqual(a: Float32Array | null, b: Float32Array | null): boolean {
@@ -3541,13 +5270,24 @@ function createGeometryWithoutSelectedTriangles(
   indices: Uint32Array,
   referencePositions: Float32Array,
   selectedMask: Uint8Array,
-): { geometry: BufferGeometry | null; referencePositions: Float32Array | null } {
+  uvs: Float32Array | null = null,
+  faceMaterialIndices: Uint8Array | null = null,
+): {
+  geometry: BufferGeometry | null;
+  referencePositions: Float32Array | null;
+  faceMaterialIndices: Uint8Array | null;
+} {
   const vertexMap = new Int32Array(positions.length / 3);
   vertexMap.fill(-1);
 
   const nextPositions: number[] = [];
   const nextReferencePositions: number[] = [];
+  const nextUvs: number[] = [];
   const nextIndices: number[] = [];
+  const nextFaceMaterialIndices: number[] = [];
+  const shouldCopyUvs = uvs !== null && uvs.length >= vertexMap.length * 2;
+  const shouldCopyFaceMaterials =
+    faceMaterialIndices !== null && faceMaterialIndices.length >= indices.length / 3;
 
   for (let triangle = 0; triangle < indices.length / 3; triangle += 1) {
     if (selectedMask[triangle] !== 0) {
@@ -3572,9 +5312,16 @@ function createGeometryWithoutSelectedTriangles(
           referencePositions[positionOffset + 1],
           referencePositions[positionOffset + 2],
         );
+        if (shouldCopyUvs) {
+          const uvOffset = sourceVertex * 2;
+          nextUvs.push(uvs[uvOffset], uvs[uvOffset + 1]);
+        }
       }
 
       nextIndices.push(targetVertex);
+    }
+    if (shouldCopyFaceMaterials) {
+      nextFaceMaterialIndices.push(faceMaterialIndices[triangle]);
     }
   }
 
@@ -3582,30 +5329,396 @@ function createGeometryWithoutSelectedTriangles(
     return {
       geometry: null,
       referencePositions: null,
+      faceMaterialIndices: null,
     };
   }
 
   const geometry = new BufferGeometry();
   geometry.setAttribute('position', new BufferAttribute(new Float32Array(nextPositions), 3));
+  if (shouldCopyUvs) {
+    geometry.setAttribute('uv', new BufferAttribute(new Float32Array(nextUvs), 2));
+  }
   geometry.setIndex(new BufferAttribute(new Uint32Array(nextIndices), 1));
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
   return {
     geometry,
     referencePositions: new Float32Array(nextReferencePositions),
+    faceMaterialIndices:
+      shouldCopyFaceMaterials && nextFaceMaterialIndices.some((materialIndex) => materialIndex !== 0)
+        ? new Uint8Array(nextFaceMaterialIndices)
+        : null,
   };
 }
 
 function createGeometryFromMeshArrays(
   positions: ArrayLike<number>,
   indices: ArrayLike<number>,
+  uvs: ArrayLike<number> | null = null,
 ): BufferGeometry {
   const geometry = new BufferGeometry();
   geometry.setAttribute('position', new BufferAttribute(new Float32Array(positions), 3));
+  if (uvs && uvs.length >= Math.floor(positions.length / 3) * 2) {
+    geometry.setAttribute('uv', new BufferAttribute(new Float32Array(uvs), 2));
+  }
   geometry.setIndex(new BufferAttribute(new Uint32Array(indices), 1));
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
   return geometry;
+}
+
+function createMeshMaterials(
+  texture: Texture | null,
+  sculptMatcapTexture: CanvasTexture,
+  faceMaterialIndices: Uint8Array | null,
+  viewMode: MeshViewMode,
+): Material | Material[] {
+  const baseMaterial = createScanViewMaterial(texture, sculptMatcapTexture, viewMode);
+
+  if (!faceMaterialIndices?.some((materialIndex) => materialIndex !== 0)) {
+    return baseMaterial;
+  }
+
+  const fillMaterial =
+    viewMode === 'wireframe'
+      ? new MeshBasicMaterial({
+          color: '#4b5563',
+          side: DoubleSide,
+          wireframe: true,
+        })
+      : new MeshMatcapMaterial({
+          color: '#d8dde3',
+          matcap: sculptMatcapTexture,
+          side: DoubleSide,
+        });
+  return [baseMaterial, fillMaterial];
+}
+
+function createScanViewMaterial(
+  texture: Texture | null,
+  sculptMatcapTexture: CanvasTexture,
+  viewMode: MeshViewMode,
+): Material {
+  if (viewMode === 'wireframe') {
+    return new MeshBasicMaterial({
+      color: '#26313d',
+      side: DoubleSide,
+      wireframe: true,
+    });
+  }
+
+  if (viewMode === 'shaded') {
+    return new MeshMatcapMaterial({
+      color: '#e8ebef',
+      matcap: sculptMatcapTexture,
+      side: DoubleSide,
+    });
+  }
+
+  return texture
+    ? new MeshBasicMaterial({
+        map: texture,
+        side: DoubleSide,
+      })
+    : new MeshMatcapMaterial({
+        color: '#e8ebef',
+        matcap: sculptMatcapTexture,
+        side: DoubleSide,
+        vertexColors: true,
+      });
+}
+
+function applyFaceMaterialGroups(
+  geometry: BufferGeometry,
+  faceMaterialIndices: Uint8Array | null,
+): void {
+  geometry.clearGroups();
+  if (!faceMaterialIndices?.some((materialIndex) => materialIndex !== 0)) {
+    return;
+  }
+
+  let startTriangle = 0;
+  let currentMaterial = faceMaterialIndices[0] ?? 0;
+  for (let triangle = 1; triangle < faceMaterialIndices.length; triangle += 1) {
+    const material = faceMaterialIndices[triangle] ?? 0;
+    if (material === currentMaterial) {
+      continue;
+    }
+
+    geometry.addGroup(startTriangle * 3, (triangle - startTriangle) * 3, currentMaterial);
+    startTriangle = triangle;
+    currentMaterial = material;
+  }
+
+  geometry.addGroup(
+    startTriangle * 3,
+    (faceMaterialIndices.length - startTriangle) * 3,
+    currentMaterial,
+  );
+}
+
+function createHoleFillFaceMaterialIndices(
+  sourceFaceMaterialIndices: Uint8Array | null,
+  previousTriangleCount: number,
+  nextTriangleCount: number,
+): Uint8Array | null {
+  if (nextTriangleCount <= previousTriangleCount) {
+    return sourceFaceMaterialIndices?.slice() ?? null;
+  }
+
+  const faceMaterialIndices = new Uint8Array(nextTriangleCount);
+  if (sourceFaceMaterialIndices) {
+    faceMaterialIndices.set(
+      sourceFaceMaterialIndices.subarray(0, Math.min(sourceFaceMaterialIndices.length, previousTriangleCount)),
+    );
+  }
+
+  faceMaterialIndices.fill(1, previousTriangleCount);
+  return faceMaterialIndices;
+}
+
+function copyGeometryUvs(geometry: BufferGeometry): Float32Array | null {
+  const uvAttribute = geometry.getAttribute('uv');
+  if (!uvAttribute || uvAttribute.itemSize < 2) {
+    return null;
+  }
+
+  const uvs = new Float32Array(uvAttribute.count * 2);
+  for (let vertex = 0; vertex < uvAttribute.count; vertex += 1) {
+    const offset = vertex * 2;
+    uvs[offset] = uvAttribute.getX(vertex);
+    uvs[offset + 1] = uvAttribute.getY(vertex);
+  }
+
+  return uvs;
+}
+
+function createHoleFillUvs(
+  sourceUvs: Float32Array | null,
+  positions: ArrayLike<number>,
+  boundaryVertexIds: ArrayLike<number>,
+  newVertexIds: ArrayLike<number>,
+): Float32Array | null {
+  if (!sourceUvs) {
+    return null;
+  }
+
+  const vertexCount = Math.floor(positions.length / 3);
+  const previousVertexCount = Math.floor(sourceUvs.length / 2);
+  if (vertexCount <= previousVertexCount || newVertexIds.length === 0) {
+    return sourceUvs.length === vertexCount * 2 ? sourceUvs.slice() : null;
+  }
+
+  const uvs = new Float32Array(vertexCount * 2);
+  uvs.set(sourceUvs.subarray(0, Math.min(sourceUvs.length, uvs.length)));
+
+  const samples = collectBoundaryUvSamples(positions, sourceUvs, boundaryVertexIds);
+  if (samples.length === 0) {
+    return uvs;
+  }
+
+  const uvFit = samples.length >= 3 ? fitBoundaryUvPlane(samples) : null;
+  for (let i = 0; i < newVertexIds.length; i += 1) {
+    const vertex = newVertexIds[i];
+    if (vertex < 0 || vertex >= vertexCount) {
+      continue;
+    }
+
+    const positionOffset = vertex * 3;
+    const uvOffset = vertex * 2;
+    if (uvFit) {
+      const x =
+        (positions[positionOffset] - uvFit.origin.x) * uvFit.axisU.x +
+        (positions[positionOffset + 1] - uvFit.origin.y) * uvFit.axisU.y +
+        (positions[positionOffset + 2] - uvFit.origin.z) * uvFit.axisU.z;
+      const y =
+        (positions[positionOffset] - uvFit.origin.x) * uvFit.axisV.x +
+        (positions[positionOffset + 1] - uvFit.origin.y) * uvFit.axisV.y +
+        (positions[positionOffset + 2] - uvFit.origin.z) * uvFit.axisV.z;
+      uvs[uvOffset] = uvFit.u[0] * x + uvFit.u[1] * y + uvFit.u[2];
+      uvs[uvOffset + 1] = uvFit.v[0] * x + uvFit.v[1] * y + uvFit.v[2];
+    } else {
+      const nearest = estimateUvByDistance(samples, positions, vertex);
+      uvs[uvOffset] = nearest.x;
+      uvs[uvOffset + 1] = nearest.y;
+    }
+  }
+
+  return uvs;
+}
+
+interface BoundaryUvSample {
+  position: Vector3;
+  uv: Vector2;
+}
+
+interface BoundaryUvFit {
+  origin: Vector3;
+  axisU: Vector3;
+  axisV: Vector3;
+  u: [number, number, number];
+  v: [number, number, number];
+}
+
+function collectBoundaryUvSamples(
+  positions: ArrayLike<number>,
+  sourceUvs: Float32Array,
+  boundaryVertexIds: ArrayLike<number>,
+): BoundaryUvSample[] {
+  const vertexCount = Math.floor(positions.length / 3);
+  const uvVertexCount = Math.floor(sourceUvs.length / 2);
+  const samples: BoundaryUvSample[] = [];
+  const seen = new Set<number>();
+
+  for (let i = 0; i < boundaryVertexIds.length; i += 1) {
+    const vertex = boundaryVertexIds[i];
+    if (vertex < 0 || vertex >= vertexCount || vertex >= uvVertexCount || seen.has(vertex)) {
+      continue;
+    }
+
+    seen.add(vertex);
+    const positionOffset = vertex * 3;
+    const uvOffset = vertex * 2;
+    samples.push({
+      position: new Vector3(
+        positions[positionOffset],
+        positions[positionOffset + 1],
+        positions[positionOffset + 2],
+      ),
+      uv: new Vector2(sourceUvs[uvOffset], sourceUvs[uvOffset + 1]),
+    });
+  }
+
+  return samples;
+}
+
+function fitBoundaryUvPlane(samples: BoundaryUvSample[]): BoundaryUvFit | null {
+  const origin = new Vector3();
+  for (let i = 0; i < samples.length; i += 1) {
+    origin.add(samples[i].position);
+  }
+  origin.multiplyScalar(1 / samples.length);
+
+  const normal = new Vector3();
+  for (let i = 0; i < samples.length; i += 1) {
+    const current = samples[i].position.clone().sub(origin);
+    const next = samples[(i + 1) % samples.length].position.clone().sub(origin);
+    normal.add(current.cross(next));
+  }
+  if (normal.lengthSq() <= 1e-12) {
+    return null;
+  }
+  normal.normalize();
+
+  let axisU = new Vector3();
+  let farthestDistanceSq = 0;
+  for (let i = 0; i < samples.length; i += 1) {
+    const candidate = samples[i].position.clone().sub(origin);
+    const distanceSq = candidate.lengthSq();
+    if (distanceSq > farthestDistanceSq) {
+      farthestDistanceSq = distanceSq;
+      axisU = candidate;
+    }
+  }
+  if (axisU.lengthSq() <= 1e-12) {
+    return null;
+  }
+  axisU.normalize();
+  const axisV = normal.clone().cross(axisU).normalize();
+
+  const matrix = [0, 0, 0, 0, 0, 0, 0, 0, samples.length] as [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ];
+  const rhsU: [number, number, number] = [0, 0, 0];
+  const rhsV: [number, number, number] = [0, 0, 0];
+
+  for (let i = 0; i < samples.length; i += 1) {
+    const delta = samples[i].position.clone().sub(origin);
+    const x = delta.dot(axisU);
+    const y = delta.dot(axisV);
+    matrix[0] += x * x;
+    matrix[1] += x * y;
+    matrix[2] += x;
+    matrix[3] += x * y;
+    matrix[4] += y * y;
+    matrix[5] += y;
+    matrix[6] += x;
+    matrix[7] += y;
+    rhsU[0] += x * samples[i].uv.x;
+    rhsU[1] += y * samples[i].uv.x;
+    rhsU[2] += samples[i].uv.x;
+    rhsV[0] += x * samples[i].uv.y;
+    rhsV[1] += y * samples[i].uv.y;
+    rhsV[2] += samples[i].uv.y;
+  }
+
+  const u = solveThreeByThree(matrix, rhsU);
+  const v = solveThreeByThree(matrix, rhsV);
+  if (!u || !v) {
+    return null;
+  }
+
+  return { origin, axisU, axisV, u, v };
+}
+
+function solveThreeByThree(
+  matrix: [number, number, number, number, number, number, number, number, number],
+  rhs: [number, number, number],
+): [number, number, number] | null {
+  const determinant =
+    matrix[0] * (matrix[4] * matrix[8] - matrix[5] * matrix[7]) -
+    matrix[1] * (matrix[3] * matrix[8] - matrix[5] * matrix[6]) +
+    matrix[2] * (matrix[3] * matrix[7] - matrix[4] * matrix[6]);
+  if (Math.abs(determinant) <= 1e-12) {
+    return null;
+  }
+
+  const detX =
+    rhs[0] * (matrix[4] * matrix[8] - matrix[5] * matrix[7]) -
+    matrix[1] * (rhs[1] * matrix[8] - matrix[5] * rhs[2]) +
+    matrix[2] * (rhs[1] * matrix[7] - matrix[4] * rhs[2]);
+  const detY =
+    matrix[0] * (rhs[1] * matrix[8] - matrix[5] * rhs[2]) -
+    rhs[0] * (matrix[3] * matrix[8] - matrix[5] * matrix[6]) +
+    matrix[2] * (matrix[3] * rhs[2] - rhs[1] * matrix[6]);
+  const detZ =
+    matrix[0] * (matrix[4] * rhs[2] - rhs[1] * matrix[7]) -
+    matrix[1] * (matrix[3] * rhs[2] - rhs[1] * matrix[6]) +
+    rhs[0] * (matrix[3] * matrix[7] - matrix[4] * matrix[6]);
+
+  return [detX / determinant, detY / determinant, detZ / determinant];
+}
+
+function estimateUvByDistance(
+  samples: BoundaryUvSample[],
+  positions: ArrayLike<number>,
+  vertex: number,
+): Vector2 {
+  const offset = vertex * 3;
+  const target = new Vector3(positions[offset], positions[offset + 1], positions[offset + 2]);
+  let sumWeight = 0;
+  const uv = new Vector2();
+
+  for (let i = 0; i < samples.length; i += 1) {
+    const distanceSq = target.distanceToSquared(samples[i].position);
+    const weight = 1 / Math.max(distanceSq, 1e-10);
+    uv.addScaledVector(samples[i].uv, weight);
+    sumWeight += weight;
+  }
+
+  if (sumWeight > 0) {
+    uv.multiplyScalar(1 / sumWeight);
+  }
+
+  return uv;
 }
 
 function orientGeometryOutward(geometry: BufferGeometry): void {
@@ -3707,9 +5820,11 @@ function createEmptySessionSnapshot(sessionId: number): SessionSnapshot {
     positions: null,
     indices: null,
     referencePositions: null,
+    uvs: null,
     history: null,
     selectedTriangleMask: null,
     selectedTriangleCount: 0,
+    faceMaterialIndices: null,
   };
 }
 

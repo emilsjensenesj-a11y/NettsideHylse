@@ -13,7 +13,7 @@ import type {
 const DEFAULT_HISTORY_LIMIT = 12;
 const SMOOTH_LAMBDA = 1.35;
 const SMOOTH_MU = -0.42;
-const BUMP_SCALE = 0.18;
+const NORMAL_DISPLACEMENT_SCALE = 0.18;
 const FLATTEN_SCALE = 0.9;
 
 export class SculptEngine {
@@ -26,6 +26,7 @@ export class SculptEngine {
   private readonly smoothBufferA: Float32Array;
   private readonly smoothBufferB: Float32Array;
   private readonly strokeVertexMarks: Uint32Array;
+  private readonly activeVertexMarks: Uint32Array;
 
   private readonly triangleScratch = new Triangle();
   private readonly triA = new Vector3();
@@ -39,6 +40,7 @@ export class SculptEngine {
   private strokeVertexIds: number[] = [];
   private strokeBeforePositions: number[] = [];
   private strokeVertexStamp = 1;
+  private activeVertexStamp = 1;
   private regionTriangleStamp = 1;
   private regionVertexStamp = 1;
   private dirtyFaceStamp = 1;
@@ -53,6 +55,7 @@ export class SculptEngine {
     this.smoothBufferA = new Float32Array(data.positions.length);
     this.smoothBufferB = new Float32Array(data.positions.length);
     this.strokeVertexMarks = new Uint32Array(data.vertexCount);
+    this.activeVertexMarks = new Uint32Array(data.vertexCount);
   }
 
   getHistoryState(): HistoryState {
@@ -151,16 +154,20 @@ export class SculptEngine {
     this.captureStrokeBefore(activeCount);
 
     switch (stamp.type) {
-      case 'bump':
-        this.applyBump(stamp, activeCount);
-        break;
       case 'smooth':
         this.applySmooth(stamp, activeCount);
+        break;
+      case 'inflate':
+        this.applyNormalDisplacement(stamp, activeCount, 1);
+        break;
+      case 'carve':
+        this.applyNormalDisplacement(stamp, activeCount, -1);
         break;
       case 'flatten':
         this.applyFlatten(stamp, activeCount);
         break;
     }
+    this.synchronizeActivePositionGroups(activeCount);
 
     const dirtyVertexCount = this.recomputeLocalNormals(activeCount);
     this.markAttributeRanges(this.data.positionAttribute, this.activeVertices, activeCount);
@@ -273,13 +280,14 @@ export class SculptEngine {
   }
 
   private populateActiveVertices(stamp: BrushStamp, candidateCount: number): number {
-    const { regionVertices, positions } = this.data;
+    const { regionVertices, positions, positionGroupOffsets, positionGroupVertices } = this.data;
     const radius = stamp.radius;
     const invRadius = 1 / radius;
     const cx = stamp.pointLocal.x;
     const cy = stamp.pointLocal.y;
     const cz = stamp.pointLocal.z;
 
+    this.activeVertexStamp = nextStamp(this.activeVertexMarks, this.activeVertexStamp);
     let activeCount = 0;
     for (let i = 0; i < candidateCount; i += 1) {
       const vertex = regionVertices[i];
@@ -299,9 +307,21 @@ export class SculptEngine {
         continue;
       }
 
-      this.weightByVertex[vertex] = falloff;
-      this.activeVertices[activeCount] = vertex;
-      activeCount += 1;
+      for (
+        let groupOffset = positionGroupOffsets[vertex];
+        groupOffset < positionGroupOffsets[vertex + 1];
+        groupOffset += 1
+      ) {
+        const groupVertex = positionGroupVertices[groupOffset];
+        if (this.activeVertexMarks[groupVertex] === this.activeVertexStamp) {
+          continue;
+        }
+
+        this.activeVertexMarks[groupVertex] = this.activeVertexStamp;
+        this.weightByVertex[groupVertex] = falloff;
+        this.activeVertices[activeCount] = groupVertex;
+        activeCount += 1;
+      }
     }
 
     return activeCount;
@@ -326,9 +346,9 @@ export class SculptEngine {
     }
   }
 
-  private applyBump(stamp: BrushStamp, activeCount: number): void {
+  private applyNormalDisplacement(stamp: BrushStamp, activeCount: number, direction: 1 | -1): void {
     const { positions, normals } = this.data;
-    const amplitude = stamp.radius * stamp.strength * BUMP_SCALE;
+    const amplitude = stamp.radius * stamp.strength * NORMAL_DISPLACEMENT_SCALE * direction;
 
     for (let i = 0; i < activeCount; i += 1) {
       const vertex = this.activeVertices[i];
@@ -502,6 +522,56 @@ export class SculptEngine {
       positions[offset] -= normalX * planeDistance * weight;
       positions[offset + 1] -= normalY * planeDistance * weight;
       positions[offset + 2] -= normalZ * planeDistance * weight;
+    }
+  }
+
+  private synchronizeActivePositionGroups(activeCount: number): void {
+    const { positions, positionGroupOffsets, positionGroupVertices } = this.data;
+    const groupStamp = nextStamp(this.activeVertexMarks, this.activeVertexStamp);
+    this.activeVertexStamp = groupStamp;
+
+    for (let i = 0; i < activeCount; i += 1) {
+      const vertex = this.activeVertices[i];
+      if (this.activeVertexMarks[vertex] === groupStamp) {
+        continue;
+      }
+
+      let sumX = 0;
+      let sumY = 0;
+      let sumZ = 0;
+      let count = 0;
+      for (
+        let groupOffset = positionGroupOffsets[vertex];
+        groupOffset < positionGroupOffsets[vertex + 1];
+        groupOffset += 1
+      ) {
+        const groupVertex = positionGroupVertices[groupOffset];
+        this.activeVertexMarks[groupVertex] = groupStamp;
+        const offset = groupVertex * 3;
+        sumX += positions[offset];
+        sumY += positions[offset + 1];
+        sumZ += positions[offset + 2];
+        count += 1;
+      }
+
+      if (count < 2) {
+        continue;
+      }
+
+      const x = sumX / count;
+      const y = sumY / count;
+      const z = sumZ / count;
+      for (
+        let groupOffset = positionGroupOffsets[vertex];
+        groupOffset < positionGroupOffsets[vertex + 1];
+        groupOffset += 1
+      ) {
+        const groupVertex = positionGroupVertices[groupOffset];
+        const offset = groupVertex * 3;
+        positions[offset] = x;
+        positions[offset + 1] = y;
+        positions[offset + 2] = z;
+      }
     }
   }
 

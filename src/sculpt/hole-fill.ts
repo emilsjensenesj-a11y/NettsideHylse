@@ -226,10 +226,15 @@ const DEFAULT_OPTIONS: FillOptions = {
 export function createMesh(
   positionsInput: ArrayLike<number>,
   indicesInput: ArrayLike<number>,
+  canonicalPositionsInput: ArrayLike<number> = positionsInput,
 ): Mesh {
   const positions = Array.from(positionsInput);
+  const canonicalPositions = Array.from(canonicalPositionsInput);
   const indices = Array.from(indicesInput);
   const vertexCount = positions.length / 3;
+  const canonicalByVertex = buildCanonicalVerticesByPosition(
+    canonicalPositions.length === positions.length ? canonicalPositions : positions,
+  );
   const mesh: Mesh = {
     positions,
     indices,
@@ -244,7 +249,13 @@ export function createMesh(
 
   for (let face = 0; face < indices.length / 3; face += 1) {
     const offset = face * 3;
-    addFaceConnectivity(mesh, face, indices[offset], indices[offset + 1], indices[offset + 2]);
+    addFaceConnectivity(
+      mesh,
+      face,
+      canonicalByVertex[indices[offset]],
+      canonicalByVertex[indices[offset + 1]],
+      canonicalByVertex[indices[offset + 2]],
+    );
   }
 
   recomputeLocalNormals(
@@ -1434,6 +1445,7 @@ export function fillHole(
   let lastQualityReport: PatchQualityReport | null = null;
   let lastFaired = false;
   let lastStrategyName = 'full';
+  let usedSimpleGrayCapFallback = false;
   const triangulationState: { result: TriangulationResult | null } = { result: null };
 
   const ensureTriangulation = (): TriangulationResult => {
@@ -1579,6 +1591,20 @@ export function fillHole(
     };
   }
 
+  if (!patch && lastQualityReport?.reason === 'aspect_ratio') {
+    const fallbackTriangulation = ensureTriangulation();
+    if (fallbackTriangulation.success) {
+      patch = createSimpleCapPatch(mesh, boundaryLoop, fallbackTriangulation.triangles, boundaryUv);
+      orientPatchTrianglesTowardNormal(patch, stats.averageNormal);
+      usedSimpleGrayCapFallback = true;
+      debugLog?.('fill:simple-cap-fallback', {
+        previousStrategy: lastStrategyName,
+        previousAspectRatio: lastQualityReport.aspectRatio,
+        patchTriangleCount: patch.triangles.length,
+      });
+    }
+  }
+
   if (!patch) {
     timings.totalMs = now() - totalStart;
     debugLog?.('fill:fairing-failed', {
@@ -1602,7 +1628,7 @@ export function fillHole(
     };
   }
 
-  const seamDeviation = measureSeamNormalDeviation(mesh, boundaryLoop, patch);
+  const seamDeviation = usedSimpleGrayCapFallback ? 0 : measureSeamNormalDeviation(mesh, boundaryLoop, patch);
   if (seamDeviation > resolvedOptions.maxAllowedNormalDeviation) {
     timings.totalMs = now() - totalStart;
     debugLog?.('fill:seam-rejected', {
@@ -1639,7 +1665,9 @@ export function fillHole(
   return {
     success: true,
     reason: null,
-    message: `Filled a ${stats.classification} hole with ${insertion.newVertexIds.length} new vertices and ${insertion.newFaceIds.length} new faces.`,
+    message: usedSimpleGrayCapFallback
+      ? `Filled a ${stats.classification} hole with a simple gray cap.`
+      : `Filled a ${stats.classification} hole with ${insertion.newVertexIds.length} new vertices and ${insertion.newFaceIds.length} new faces.`,
     patch: {
       newVertexIds: insertion.newVertexIds,
       newFaceIds: insertion.newFaceIds,
@@ -1742,6 +1770,15 @@ function createInitialPatch(
     boundaryVertexCount: boundaryLoop.length,
     adjacency: buildPatchAdjacency(vertices.length, patchTriangles),
   };
+}
+
+function createSimpleCapPatch(
+  mesh: Mesh,
+  boundaryLoop: number[],
+  triangles: number[],
+  boundaryUv: Vec2[],
+): PatchWork {
+  return createInitialPatch(mesh, boundaryLoop, triangles, boundaryUv);
 }
 
 function createSampledPatch(
@@ -2642,6 +2679,10 @@ function estimateSeamBias(
 }
 
 function addFaceConnectivity(mesh: Mesh, faceId: number, a: number, b: number, c: number): void {
+  if (a === b || b === c || c === a) {
+    return;
+  }
+
   mesh.vertexFaces[a].push(faceId);
   mesh.vertexFaces[b].push(faceId);
   mesh.vertexFaces[c].push(faceId);
@@ -2654,6 +2695,27 @@ function addFaceConnectivity(mesh: Mesh, faceId: number, a: number, b: number, c
   addEdgeFace(mesh.edgeToFaces, a, b, faceId);
   addEdgeFace(mesh.edgeToFaces, b, c, faceId);
   addEdgeFace(mesh.edgeToFaces, c, a, faceId);
+}
+
+function buildCanonicalVerticesByPosition(positions: number[]): Uint32Array {
+  const vertexCount = positions.length / 3;
+  const canonicalByVertex = new Uint32Array(vertexCount);
+  const canonicalByPosition = new Map<string, number>();
+
+  for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+    const offset = vertex * 3;
+    const key = `${positions[offset].toFixed(5)},${positions[offset + 1].toFixed(5)},${positions[offset + 2].toFixed(5)}`;
+    const existing = canonicalByPosition.get(key);
+    if (existing !== undefined) {
+      canonicalByVertex[vertex] = existing;
+      continue;
+    }
+
+    canonicalByPosition.set(key, vertex);
+    canonicalByVertex[vertex] = vertex;
+  }
+
+  return canonicalByVertex;
 }
 
 function appendVertex(mesh: Mesh, position: Vec3): number {

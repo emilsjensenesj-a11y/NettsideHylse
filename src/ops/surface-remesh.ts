@@ -57,6 +57,7 @@ const FREE_BOUNDARY_SMOOTH_BLEND = 0.16;
 const FREE_BOUNDARY_SMOOTH_BLEND_SOFT = 0.28;
 const MIN_NORMAL_DOT = 0.15;
 const MIN_TRIANGLE_AREA = 1e-10;
+const REMESH_WELD_TOLERANCE_MM = 0.01;
 
 const queryPoint = new Vector3();
 const hitPoint = new Vector3();
@@ -115,9 +116,7 @@ export function surfaceRemeshMesh(
   let geometry = new BufferGeometry();
   geometry.setAttribute('position', new BufferAttribute(new Float32Array(mesh.positions), 3));
   geometry.setIndex(new BufferAttribute(new Uint32Array(mesh.indices), 1));
-  geometry = mergeVertices(geometry, Math.max(effectiveEdgeSize * 0.01, 1e-5));
-  geometry.computeBoundingBox();
-  geometry.computeBoundingSphere();
+  geometry = weldGeometryByDistance(geometry);
 
   return {
     geometry,
@@ -125,6 +124,16 @@ export function surfaceRemeshMesh(
     iterations,
     clamped,
   };
+}
+
+export function weldGeometryByDistance(
+  geometry: BufferGeometry,
+  toleranceMm = REMESH_WELD_TOLERANCE_MM,
+): BufferGeometry {
+  const welded = mergeVertices(geometry, toleranceMm);
+  welded.computeBoundingBox();
+  welded.computeBoundingSphere();
+  return welded;
 }
 
 function splitLongEdges(
@@ -909,12 +918,16 @@ function resolveVertex(remap: Int32Array, vertex: number): number {
 }
 
 function distanceBetweenVertices(positions: number[], a: number, b: number): number {
+  return Math.sqrt(distanceBetweenVerticesSq(positions, a, b));
+}
+
+function distanceBetweenVerticesSq(positions: number[], a: number, b: number): number {
   const aOffset = a * 3;
   const bOffset = b * 3;
   const dx = positions[bOffset] - positions[aOffset];
   const dy = positions[bOffset + 1] - positions[aOffset + 1];
   const dz = positions[bOffset + 2] - positions[aOffset + 2];
-  return Math.hypot(dx, dy, dz);
+  return dx * dx + dy * dy + dz * dz;
 }
 
 function getVertex(positions: number[], vertex: number): [number, number, number] {

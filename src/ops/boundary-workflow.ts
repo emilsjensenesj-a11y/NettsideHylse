@@ -24,6 +24,7 @@ export function smoothBoundaryLoopVertices(
   orderedVertexIds: Uint32Array,
   intensity: number,
   iterations: number,
+  options: { constrainToTangent?: boolean } = {},
 ): Float32Array | null {
   if (orderedVertexIds.length < 3) {
     return null;
@@ -31,6 +32,7 @@ export function smoothBoundaryLoopVertices(
 
   const resolvedIntensity = clamp(intensity, 0, 1);
   const resolvedIterations = Math.max(1, Math.round(iterations));
+  const constrainToTangent = options.constrainToTangent ?? true;
   let current = new Float32Array(positions);
   let next = new Float32Array(current.length);
 
@@ -54,20 +56,22 @@ export function smoothBoundaryLoopVertices(
       let deltaY = targetY - current[vertexOffset + 1];
       let deltaZ = targetZ - current[vertexOffset + 2];
 
-      const normalX = normals[vertexOffset];
-      const normalY = normals[vertexOffset + 1];
-      const normalZ = normals[vertexOffset + 2];
-      const normalLength = Math.hypot(normalX, normalY, normalZ);
-      if (normalLength > 1e-8) {
-        const invNormalLength = 1 / normalLength;
-        const normalizedX = normalX * invNormalLength;
-        const normalizedY = normalY * invNormalLength;
-        const normalizedZ = normalZ * invNormalLength;
-        const normalComponent =
-          deltaX * normalizedX + deltaY * normalizedY + deltaZ * normalizedZ;
-        deltaX -= normalComponent * normalizedX;
-        deltaY -= normalComponent * normalizedY;
-        deltaZ -= normalComponent * normalizedZ;
+      if (constrainToTangent) {
+        const normalX = normals[vertexOffset];
+        const normalY = normals[vertexOffset + 1];
+        const normalZ = normals[vertexOffset + 2];
+        const normalLength = Math.hypot(normalX, normalY, normalZ);
+        if (normalLength > 1e-8) {
+          const invNormalLength = 1 / normalLength;
+          const normalizedX = normalX * invNormalLength;
+          const normalizedY = normalY * invNormalLength;
+          const normalizedZ = normalZ * invNormalLength;
+          const normalComponent =
+            deltaX * normalizedX + deltaY * normalizedY + deltaZ * normalizedZ;
+          deltaX -= normalComponent * normalizedX;
+          deltaY -= normalComponent * normalizedY;
+          deltaZ -= normalComponent * normalizedZ;
+        }
       }
 
       next[vertexOffset] = current[vertexOffset] + deltaX * resolvedIntensity;

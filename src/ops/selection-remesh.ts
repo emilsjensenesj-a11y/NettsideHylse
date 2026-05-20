@@ -31,6 +31,8 @@ interface BoundaryCandidate {
   used: boolean;
 }
 
+const REMESH_WELD_TOLERANCE_MM = 0.01;
+
 export function remeshSelectedTriangles(
   positions: ArrayLike<number>,
   indices: ArrayLike<number>,
@@ -317,6 +319,7 @@ function compactMesh(
   const vertexCount = positions.length / 3;
   const remap = new Int32Array(vertexCount);
   remap.fill(-1);
+  const weldBuckets = new Map<string, number>();
   const compactedPositions: number[] = [];
   const compactedReferencePositions: number[] = [];
   const compactedIndices = new Uint32Array(indices.length);
@@ -326,9 +329,23 @@ function compactMesh(
     const sourceVertex = indices[i];
     let targetVertex = remap[sourceVertex];
     if (targetVertex === -1) {
+      const offset = sourceVertex * 3;
+      const weldKey = makePositionWeldKey(
+        positions[offset],
+        positions[offset + 1],
+        positions[offset + 2],
+      );
+      const weldedVertex = weldBuckets.get(weldKey);
+      if (weldedVertex != null) {
+        targetVertex = weldedVertex;
+        remap[sourceVertex] = targetVertex;
+        compactedIndices[i] = targetVertex;
+        continue;
+      }
+
       targetVertex = nextVertex;
       remap[sourceVertex] = targetVertex;
-      const offset = sourceVertex * 3;
+      weldBuckets.set(weldKey, targetVertex);
       compactedPositions.push(positions[offset], positions[offset + 1], positions[offset + 2]);
       compactedReferencePositions.push(
         referencePositions[offset],
@@ -346,6 +363,11 @@ function compactMesh(
     referencePositions: Float32Array.from(compactedReferencePositions),
     indices: compactedIndices,
   };
+}
+
+function makePositionWeldKey(x: number, y: number, z: number): string {
+  const scale = 1 / REMESH_WELD_TOLERANCE_MM;
+  return `${Math.round(x * scale)},${Math.round(y * scale)},${Math.round(z * scale)}`;
 }
 
 function collectBoundaryVertexIds(indices: ArrayLike<number>): Uint32Array {

@@ -426,7 +426,7 @@ export function laplacianSmoothSelected(
   }
 
   return {
-    positions: current,
+    positions: synchronizeCoincidentReferencePositions(current, referencePositions),
     indices: new Uint32Array(indices),
     referencePositions: new Float32Array(referencePositions),
     selectedTriangleMask: selectedTriangleMask.slice(),
@@ -524,12 +524,62 @@ export function laplacianSmoothSelectionBoundary(
   }
 
   return {
-    positions: current,
+    positions: synchronizeCoincidentReferencePositions(current, referencePositions),
     indices: new Uint32Array(indices),
     referencePositions: new Float32Array(referencePositions),
     selectedTriangleMask: selectedTriangleMask.slice(),
     triangleSourceIds: createIdentitySources(selectedTriangleMask.length),
   };
+}
+
+function synchronizeCoincidentReferencePositions(
+  positions: Float32Array,
+  referencePositions: ArrayLike<number>,
+): Float32Array {
+  if (referencePositions.length !== positions.length) {
+    return positions;
+  }
+
+  const groups = new Map<string, number[]>();
+  for (let vertex = 0; vertex < positions.length / 3; vertex += 1) {
+    const offset = vertex * 3;
+    const key = `${referencePositions[offset].toFixed(5)},${referencePositions[offset + 1].toFixed(5)},${referencePositions[offset + 2].toFixed(5)}`;
+    const group = groups.get(key);
+    if (group) {
+      group.push(vertex);
+    } else {
+      groups.set(key, [vertex]);
+    }
+  }
+
+  for (const group of groups.values()) {
+    if (group.length < 2) {
+      continue;
+    }
+
+    let sumX = 0;
+    let sumY = 0;
+    let sumZ = 0;
+    for (let i = 0; i < group.length; i += 1) {
+      const offset = group[i] * 3;
+      sumX += positions[offset];
+      sumY += positions[offset + 1];
+      sumZ += positions[offset + 2];
+    }
+
+    const invCount = 1 / group.length;
+    const x = sumX * invCount;
+    const y = sumY * invCount;
+    const z = sumZ * invCount;
+    for (let i = 0; i < group.length; i += 1) {
+      const offset = group[i] * 3;
+      positions[offset] = x;
+      positions[offset + 1] = y;
+      positions[offset + 2] = z;
+    }
+  }
+
+  return positions;
 }
 
 function getOrCreateMidpoint(

@@ -23,6 +23,8 @@ export interface EditableMeshData {
   vertexFaces: Uint32Array;
   vertexNeighborOffsets: Uint32Array;
   vertexNeighbors: Uint32Array;
+  positionGroupOffsets: Uint32Array;
+  positionGroupVertices: Uint32Array;
   triangleNeighbors: Int32Array;
   regionQueue: Uint32Array;
   regionTriangles: Uint32Array;
@@ -55,6 +57,8 @@ export function createEditableMeshData(
   const vertexCount = positionAttribute.count;
   const triangleCount = indices.length / 3;
   const referencePositions = normalizeReferencePositions(options.referencePositions, positions);
+  synchronizeCoincidentPositionsByReference(positions, referencePositions);
+  const positionGroups = buildPositionGroups(referencePositions, vertexCount);
 
   const normals = new Float32Array(vertexCount * 3);
   const normalAttribute = new BufferAttribute(normals, 3);
@@ -66,8 +70,9 @@ export function createEditableMeshData(
   geometry.setAttribute('normal', normalAttribute);
   geometry.setAttribute('color', colorAttribute);
 
-  const { offsets: vertexFaceOffsets, values: vertexFaces } = buildVertexFaceAdjacency(
+  const { offsets: vertexFaceOffsets, values: vertexFaces } = buildPositionAwareVertexFaceAdjacency(
     indices,
+    positionGroups.canonicalByVertex,
     vertexCount,
     triangleCount,
   );
@@ -76,6 +81,7 @@ export function createEditableMeshData(
     triangleCount,
     vertexFaceOffsets,
     vertexFaces,
+    positionGroups.canonicalByVertex,
   );
   const { offsets: vertexNeighborOffsets, values: vertexNeighbors } =
     buildVertexNeighborAdjacency(indices, vertexCount, vertexFaceOffsets, vertexFaces);
@@ -112,6 +118,8 @@ export function createEditableMeshData(
     vertexFaces,
     vertexNeighborOffsets,
     vertexNeighbors,
+    positionGroupOffsets: positionGroups.offsets,
+    positionGroupVertices: positionGroups.values,
     triangleNeighbors,
     regionQueue: new Uint32Array(triangleCount),
     regionTriangles: new Uint32Array(triangleCount),
@@ -343,6 +351,50 @@ function buildVertexFaceAdjacency(
   return { offsets, values };
 }
 
+function buildPositionAwareVertexFaceAdjacency(
+  indices: Uint32Array,
+  canonicalByVertex: Uint32Array,
+  vertexCount: number,
+  triangleCount: number,
+): { offsets: Uint32Array; values: Uint32Array } {
+  const facesByCanonical = new Map<number, number[]>();
+  for (let triangle = 0; triangle < triangleCount; triangle += 1) {
+    const triOffset = triangle * 3;
+    for (let corner = 0; corner < 3; corner += 1) {
+      const canonical = canonicalByVertex[indices[triOffset + corner]];
+      let faces = facesByCanonical.get(canonical);
+      if (!faces) {
+        faces = [];
+        facesByCanonical.set(canonical, faces);
+      }
+
+      if (faces[faces.length - 1] !== triangle) {
+        faces.push(triangle);
+      }
+    }
+  }
+
+  const counts = new Uint32Array(vertexCount);
+  for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+    counts[vertex] = facesByCanonical.get(canonicalByVertex[vertex])?.length ?? 0;
+  }
+
+  const offsets = new Uint32Array(vertexCount + 1);
+  for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+    offsets[vertex + 1] = offsets[vertex] + counts[vertex];
+  }
+
+  const values = new Uint32Array(offsets[offsets.length - 1]);
+  for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+    const faces = facesByCanonical.get(canonicalByVertex[vertex]);
+    if (faces) {
+      values.set(faces, offsets[vertex]);
+    }
+  }
+
+  return { offsets, values };
+}
+
 function buildVertexNeighborAdjacency(
   indices: Uint32Array,
   vertexCount: number,
@@ -412,6 +464,7 @@ function buildTriangleAdjacency(
   triangleCount: number,
   vertexFaceOffsets: Uint32Array,
   vertexFaces: Uint32Array,
+  canonicalByVertex: Uint32Array,
 ): Int32Array {
   const neighbors = new Int32Array(triangleCount * 3);
   neighbors.fill(-1);
@@ -462,7 +515,10 @@ function buildTriangleAdjacency(
       for (let matchEdge = 0; matchEdge < 3; matchEdge += 1) {
         const ma = indices[matchOffset + matchEdge];
         const mb = indices[matchOffset + ((matchEdge + 1) % 3)];
-        if ((ma === a && mb === b) || (ma === b && mb === a)) {
+        if (
+          (canonicalByVertex[ma] === canonicalByVertex[a] && canonicalByVertex[mb] === canonicalByVertex[b]) ||
+          (canonicalByVertex[ma] === canonicalByVertex[b] && canonicalByVertex[mb] === canonicalByVertex[a])
+        ) {
           neighbors[matchOffset + matchEdge] = triangle;
           break;
         }
@@ -471,6 +527,103 @@ function buildTriangleAdjacency(
   }
 
   return neighbors;
+}
+
+function buildPositionGroups(
+  positions: Float32Array,
+  vertexCount: number,
+): { canonicalByVertex: Uint32Array; offsets: Uint32Array; values: Uint32Array } {
+  const canonicalByVertex = new Uint32Array(vertexCount);
+  const canonicalByPosition = new Map<string, number>();
+  const groupsByCanonical = new Map<number, number[]>();
+  for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+    const offset = vertex * 3;
+    const key = makePositionKey(positions[offset], positions[offset + 1], positions[offset + 2]);
+    const existing = canonicalByPosition.get(key);
+    if (existing !== undefined) {
+      canonicalByVertex[vertex] = existing;
+      groupsByCanonical.get(existing)?.push(vertex);
+      continue;
+    }
+
+    canonicalByPosition.set(key, vertex);
+    canonicalByVertex[vertex] = vertex;
+    groupsByCanonical.set(vertex, [vertex]);
+  }
+
+  const offsets = new Uint32Array(vertexCount + 1);
+  for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+    const group = groupsByCanonical.get(canonicalByVertex[vertex]);
+    offsets[vertex + 1] = offsets[vertex] + (group?.length ?? 1);
+  }
+
+  const values = new Uint32Array(offsets[vertexCount]);
+  for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+    const group = groupsByCanonical.get(canonicalByVertex[vertex]);
+    if (group) {
+      values.set(group, offsets[vertex]);
+    } else {
+      values[offsets[vertex]] = vertex;
+    }
+  }
+
+  return { canonicalByVertex, offsets, values };
+}
+
+function synchronizeCoincidentPositionsByReference(
+  positions: Float32Array,
+  referencePositions: Float32Array,
+): void {
+  if (positions.length !== referencePositions.length) {
+    return;
+  }
+
+  const groupsByReference = new Map<string, number[]>();
+  for (let vertex = 0; vertex < positions.length / 3; vertex += 1) {
+    const offset = vertex * 3;
+    const key = makePositionKey(
+      referencePositions[offset],
+      referencePositions[offset + 1],
+      referencePositions[offset + 2],
+    );
+    const group = groupsByReference.get(key);
+    if (group) {
+      group.push(vertex);
+    } else {
+      groupsByReference.set(key, [vertex]);
+    }
+  }
+
+  for (const group of groupsByReference.values()) {
+    if (group.length < 2) {
+      continue;
+    }
+
+    let sumX = 0;
+    let sumY = 0;
+    let sumZ = 0;
+    for (let i = 0; i < group.length; i += 1) {
+      const offset = group[i] * 3;
+      sumX += positions[offset];
+      sumY += positions[offset + 1];
+      sumZ += positions[offset + 2];
+    }
+
+    const invCount = 1 / group.length;
+    const x = sumX * invCount;
+    const y = sumY * invCount;
+    const z = sumZ * invCount;
+    for (let i = 0; i < group.length; i += 1) {
+      const offset = group[i] * 3;
+      positions[offset] = x;
+      positions[offset + 1] = y;
+      positions[offset + 2] = z;
+    }
+  }
+}
+
+function makePositionKey(x: number, y: number, z: number): string {
+  return `${x.toFixed(5)},${y.toFixed(5)},${z.toFixed(5)}`;
 }
 
 function copyIntoTypedArray<T extends TypedArray>(

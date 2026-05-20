@@ -31,7 +31,7 @@ export function extrudeBoundaryLoop(
   }
 
   if (orderedVertexIds.length < 3) {
-    throw new Error('A positive socket needs a clean boundary loop with at least 3 vertices.');
+    throw new Error('A positive limb needs a clean boundary loop with at least 3 vertices.');
   }
 
   const { positions, normals, indices, vertexCount } = editableMesh;
@@ -164,6 +164,87 @@ export function extrudeBoundaryLoopAlongVector(
 
     appendOrientedTriangle(extrudedIndices, extrudedPositions, a, b, outerB, averagedNormal);
     appendOrientedTriangle(extrudedIndices, extrudedPositions, a, outerB, outerA, averagedNormal);
+  }
+
+  const geometry = new BufferGeometry();
+  geometry.setAttribute('position', new BufferAttribute(extrudedPositions, 3));
+  geometry.setIndex(new BufferAttribute(new Uint32Array(extrudedIndices), 1));
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+
+  return {
+    geometry,
+    outerVertexIds,
+  };
+}
+
+export function extrudeBoundaryLoopToZPlane(
+  editableMesh: EditableMeshData,
+  orderedVertexIds: Uint32Array,
+  planeZ: number,
+): BoundaryExtrudeResult {
+  if (!Number.isFinite(planeZ)) {
+    throw new Error('Positive Z plane must be a valid height.');
+  }
+
+  if (orderedVertexIds.length < 3) {
+    throw new Error('A Z plane trim needs a clean boundary loop with at least 3 vertices.');
+  }
+
+  const { positions, indices, vertexCount } = editableMesh;
+  const outerVertexIds = new Uint32Array(orderedVertexIds.length);
+  const capCenterVertex = vertexCount + orderedVertexIds.length;
+  const extrudedPositions = new Float32Array((vertexCount + orderedVertexIds.length + 1) * 3);
+  extrudedPositions.set(positions, 0);
+
+  let centerX = 0;
+  let centerY = 0;
+  for (let i = 0; i < orderedVertexIds.length; i += 1) {
+    const sourceVertex = orderedVertexIds[i];
+    const outerVertex = vertexCount + i;
+    outerVertexIds[i] = outerVertex;
+
+    const sourceOffset = sourceVertex * 3;
+    const outerOffset = outerVertex * 3;
+    extrudedPositions[outerOffset] = positions[sourceOffset];
+    extrudedPositions[outerOffset + 1] = positions[sourceOffset + 1];
+    extrudedPositions[outerOffset + 2] = planeZ;
+    centerX += positions[sourceOffset];
+    centerY += positions[sourceOffset + 1];
+  }
+
+  const invCount = 1 / orderedVertexIds.length;
+  const centerOffset = capCenterVertex * 3;
+  extrudedPositions[centerOffset] = centerX * invCount;
+  extrudedPositions[centerOffset + 1] = centerY * invCount;
+  extrudedPositions[centerOffset + 2] = planeZ;
+
+  const extrudedIndices = Array.from(indices);
+  const zNormal = new Vector3(0, 0, 1);
+  for (let i = 0; i < orderedVertexIds.length; i += 1) {
+    const next = (i + 1) % orderedVertexIds.length;
+    const a = orderedVertexIds[i];
+    const b = orderedVertexIds[next];
+    const outerA = outerVertexIds[i];
+    const outerB = outerVertexIds[next];
+
+    edgeDirection
+      .set(
+        positions[b * 3] - positions[a * 3],
+        positions[b * 3 + 1] - positions[a * 3 + 1],
+        positions[b * 3 + 2] - positions[a * 3 + 2],
+      )
+      .normalize();
+    averagedNormal.crossVectors(edgeDirection, zNormal);
+    if (averagedNormal.lengthSq() <= 1e-12) {
+      averagedNormal.set(1, 0, 0);
+    } else {
+      averagedNormal.normalize();
+    }
+
+    appendOrientedTriangle(extrudedIndices, extrudedPositions, a, b, outerB, averagedNormal);
+    appendOrientedTriangle(extrudedIndices, extrudedPositions, a, outerB, outerA, averagedNormal);
+    appendOrientedTriangle(extrudedIndices, extrudedPositions, outerA, outerB, capCenterVertex, zNormal);
   }
 
   const geometry = new BufferGeometry();

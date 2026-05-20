@@ -17,14 +17,15 @@ interface EdgeRecord {
   count: number;
 }
 
-export function buildHoleLoopSet(indices: Uint32Array): HoleLoopSet {
+export function buildHoleLoopSet(indices: Uint32Array, positions?: Float32Array): HoleLoopSet {
   const edgeIndexByKey = new Map<string, number>();
   const edgeRecords: EdgeRecord[] = [];
+  const canonicalByVertex = positions ? buildCanonicalVerticesByPosition(positions) : null;
 
   for (let triangle = 0; triangle < indices.length; triangle += 3) {
-    recordEdge(indices[triangle], indices[triangle + 1], edgeIndexByKey, edgeRecords);
-    recordEdge(indices[triangle + 1], indices[triangle + 2], edgeIndexByKey, edgeRecords);
-    recordEdge(indices[triangle + 2], indices[triangle], edgeIndexByKey, edgeRecords);
+    recordEdge(indices[triangle], indices[triangle + 1], edgeIndexByKey, edgeRecords, canonicalByVertex);
+    recordEdge(indices[triangle + 1], indices[triangle + 2], edgeIndexByKey, edgeRecords, canonicalByVertex);
+    recordEdge(indices[triangle + 2], indices[triangle], edgeIndexByKey, edgeRecords, canonicalByVertex);
   }
 
   const specialEdges: EdgeRecord[] = [];
@@ -118,12 +119,118 @@ export function buildHoleLoopSet(indices: Uint32Array): HoleLoopSet {
     });
   }
 
-  loops.sort((a, b) => b.edgeCount - a.edgeCount);
+  const visibleBoundaryLoops = loops
+    .filter((loop) => loop.edgeCount >= 2 && (loop.edgeCount > 10 || loop.isBoundaryLoop))
+    .sort((a, b) => b.edgeCount - a.edgeCount);
 
   return {
-    loops,
-    edgeCount: specialEdges.length,
+    loops: visibleBoundaryLoops,
+    edgeCount: visibleBoundaryLoops.reduce((sum, loop) => sum + loop.edgeCount, 0),
   };
+}
+
+export function buildOpenBoundaryLoopCandidates(indices: Uint32Array, positions?: Float32Array): HoleLoop[] {
+  const edgeIndexByKey = new Map<string, number>();
+  const edgeRecords: EdgeRecord[] = [];
+  const canonicalByVertex = positions ? buildCanonicalVerticesByPosition(positions) : null;
+
+  for (let triangle = 0; triangle < indices.length; triangle += 3) {
+    recordEdge(indices[triangle], indices[triangle + 1], edgeIndexByKey, edgeRecords, canonicalByVertex);
+    recordEdge(indices[triangle + 1], indices[triangle + 2], edgeIndexByKey, edgeRecords, canonicalByVertex);
+    recordEdge(indices[triangle + 2], indices[triangle], edgeIndexByKey, edgeRecords, canonicalByVertex);
+  }
+
+  const boundaryEdges = edgeRecords.filter((edge) => edge.count === 1);
+  if (boundaryEdges.length === 0) {
+    return [];
+  }
+
+  const vertexToBoundaryEdges = new Map<number, number[]>();
+  for (let i = 0; i < boundaryEdges.length; i += 1) {
+    addVertexEdgeLink(vertexToBoundaryEdges, boundaryEdges[i].a, i);
+    addVertexEdgeLink(vertexToBoundaryEdges, boundaryEdges[i].b, i);
+  }
+
+  const visited = new Uint8Array(boundaryEdges.length);
+  const edgeStack = new Uint32Array(boundaryEdges.length);
+  const loops: HoleLoop[] = [];
+
+  for (let start = 0; start < boundaryEdges.length; start += 1) {
+    if (visited[start] !== 0) {
+      continue;
+    }
+
+    let stackSize = 0;
+    edgeStack[stackSize] = start;
+    stackSize += 1;
+    visited[start] = 1;
+
+    const componentPairs: number[] = [];
+    while (stackSize > 0) {
+      stackSize -= 1;
+      const edgeIndex = edgeStack[stackSize];
+      const edge = boundaryEdges[edgeIndex];
+      componentPairs.push(edge.a, edge.b);
+
+      const aConnections = vertexToBoundaryEdges.get(edge.a);
+      if (aConnections) {
+        for (let i = 0; i < aConnections.length; i += 1) {
+          const neighborEdgeIndex = aConnections[i];
+          if (visited[neighborEdgeIndex] !== 0) {
+            continue;
+          }
+          visited[neighborEdgeIndex] = 1;
+          edgeStack[stackSize] = neighborEdgeIndex;
+          stackSize += 1;
+        }
+      }
+
+      const bConnections = vertexToBoundaryEdges.get(edge.b);
+      if (bConnections) {
+        for (let i = 0; i < bConnections.length; i += 1) {
+          const neighborEdgeIndex = bConnections[i];
+          if (visited[neighborEdgeIndex] !== 0) {
+            continue;
+          }
+          visited[neighborEdgeIndex] = 1;
+          edgeStack[stackSize] = neighborEdgeIndex;
+          stackSize += 1;
+        }
+      }
+    }
+
+    const orderedVertexIds = orderBoundaryComponent(componentPairs);
+    loops.push({
+      segmentVertexPairs: new Uint32Array(componentPairs),
+      edgeCount: componentPairs.length / 2,
+      boundaryEdgeCount: componentPairs.length / 2,
+      orderedVertexIds,
+      isBoundaryLoop: orderedVertexIds !== null,
+    });
+  }
+
+  return loops.sort((a, b) => b.edgeCount - a.edgeCount);
+}
+
+export function countNonManifoldEdges(indices: Uint32Array, positions?: Float32Array): number {
+  const edgeIndexByKey = new Map<string, number>();
+  const edgeRecords: EdgeRecord[] = [];
+  const canonicalByVertex = positions ? buildCanonicalVerticesByPosition(positions) : null;
+
+  for (let triangle = 0; triangle < indices.length; triangle += 3) {
+    recordEdge(indices[triangle], indices[triangle + 1], edgeIndexByKey, edgeRecords, canonicalByVertex);
+    recordEdge(indices[triangle + 1], indices[triangle + 2], edgeIndexByKey, edgeRecords, canonicalByVertex);
+    recordEdge(indices[triangle + 2], indices[triangle], edgeIndexByKey, edgeRecords, canonicalByVertex);
+  }
+
+  let edgeCount = 0;
+  for (let i = 0; i < edgeRecords.length; i += 1) {
+    if (edgeRecords[i].count !== 2) {
+      edgeCount += 1;
+    }
+  }
+
+  return edgeCount;
 }
 
 function recordEdge(
@@ -131,13 +238,20 @@ function recordEdge(
   b: number,
   edgeIndexByKey: Map<string, number>,
   edgeRecords: EdgeRecord[],
+  canonicalByVertex: Uint32Array | null,
 ): void {
   if (a === b) {
     return;
   }
 
-  const low = Math.min(a, b);
-  const high = Math.max(a, b);
+  const canonicalA = canonicalByVertex?.[a] ?? a;
+  const canonicalB = canonicalByVertex?.[b] ?? b;
+  if (canonicalA === canonicalB) {
+    return;
+  }
+
+  const low = Math.min(canonicalA, canonicalB);
+  const high = Math.max(canonicalA, canonicalB);
   const key = `${low}:${high}`;
   const existingIndex = edgeIndexByKey.get(key);
 
@@ -152,6 +266,27 @@ function recordEdge(
   }
 
   edgeRecords[existingIndex].count += 1;
+}
+
+function buildCanonicalVerticesByPosition(positions: Float32Array): Uint32Array {
+  const vertexCount = positions.length / 3;
+  const canonicalByVertex = new Uint32Array(vertexCount);
+  const canonicalByPosition = new Map<string, number>();
+
+  for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+    const offset = vertex * 3;
+    const key = `${positions[offset].toFixed(5)},${positions[offset + 1].toFixed(5)},${positions[offset + 2].toFixed(5)}`;
+    const existing = canonicalByPosition.get(key);
+    if (existing !== undefined) {
+      canonicalByVertex[vertex] = existing;
+      continue;
+    }
+
+    canonicalByPosition.set(key, vertex);
+    canonicalByVertex[vertex] = vertex;
+  }
+
+  return canonicalByVertex;
 }
 
 function addVertexEdgeLink(

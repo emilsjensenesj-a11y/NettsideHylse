@@ -1,6 +1,6 @@
-# Fast V1 Mesh Sculptor
+# NouraSoft
 
-Browser-based mesh sculpting focused on responsive local editing. The app loads local `STL`, `OBJ`, and `PLY` meshes, then supports three brushes: `Bump / Inflate`, `Smooth`, and `Flatten`.
+Browser-based mesh sculpting focused on responsive local editing. The app loads local `STL` and `OBJ` meshes, then offers Smooth sculpting by default.
 
 ## Setup
 
@@ -9,7 +9,7 @@ npm install
 npm run dev
 ```
 
-Open the Vite URL in a browser, then use **Open STL / OBJ / PLY** to load a local mesh.
+Open the Vite URL in a browser, then use **Open STL / OBJ** to load a local mesh.
 
 ## Access From Other Devices
 
@@ -59,9 +59,9 @@ Because this app is client-side only, that hosted site stays free and does not n
 
 ## Controls
 
-- Left drag: sculpt when **Sculpt Mode** is enabled
-- `Alt` + left drag: orbit camera without leaving sculpt mode
-- Right drag: pan
+- Left drag: smooth when **Smooth Brush** mode is enabled
+- Right drag: rotate
+- Middle drag: pan
 - Mouse wheel: zoom
 - Switch to **Select** mode for face selection tools
 - `Sphere`: paint-select faces on the surface under the cursor
@@ -71,15 +71,13 @@ Because this app is client-side only, that hosted site stays free and does not n
 - `Ctrl`: subtract from the current selection
 - `Delete`: delete the selected faces
 - `Fill Hole`: inspect open loops in blue, hover a clean boundary in purple, then left click to patch it
-- `Bump / Inflate`: pushes vertices along their local normals
 - `Smooth`: local Taubin-style smoothing over the affected region
-- `Flatten`: pushes vertices toward a locally estimated plane
 - `Undo / Redo`: restores recent strokes from a short ring buffer
 - `Reset View`: frames the loaded mesh again
 
 ## Sculpting Data Flow
 
-1. The selected file is parsed with the Three.js STL, OBJ, or PLY loader and normalized into one indexed `BufferGeometry`.
+1. The selected file is parsed with the Three.js STL or OBJ loader and normalized into one indexed `BufferGeometry`.
 2. Duplicate vertices are welded, the mesh is centered, and cached adjacency is built for `vertex -> faces`, `vertex -> neighbors`, and triangle-to-triangle traversal.
 3. The editable mesh keeps `position` and `normal` typed arrays as the authoritative data used by both the sculpt engine and the Three.js geometry attributes.
 4. `three-mesh-bvh` builds one BVH after load. Brush picking uses `firstHitOnly` raycasts, and edits call `boundsTree.refit()` instead of rebuilding the tree every mouse move.

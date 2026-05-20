@@ -1,5 +1,13 @@
-export type BrushType = 'bump' | 'smooth' | 'flatten';
-export type InteractionMode = 'sculpt' | 'select' | 'fill' | 'boundary' | 'positive' | 'remesh' | 'thicken';
+// Inflate, carve, and flatten are retained for later clinician-gated tooling.
+export type BrushType = 'smooth' | 'inflate' | 'carve' | 'flatten';
+export type InteractionMode =
+  | 'sculpt'
+  | 'select'
+  | 'fill'
+  | 'boundary'
+  | 'positive'
+  | 'remesh'
+  | 'thicken';
 export type SelectionTool = 'sphere' | 'box' | 'snip';
 
 export interface Vec3Like {
@@ -44,6 +52,17 @@ export interface MeshStats {
   vertexCount: number;
   triangleCount: number;
   boundsRadius: number;
+}
+
+export interface MeasurementRow {
+  distanceFromDistalMm: number;
+  circumferenceMm: number;
+}
+
+export interface MeasurementState {
+  rows: MeasurementRow[];
+  totalHeightMm: number;
+  clickedHeightMm: number | null;
 }
 
 export interface HoleLoopSummary {
