@@ -18,6 +18,7 @@ const FLATTEN_SCALE = 0.9;
 
 export class SculptEngine {
   readonly data: EditableMeshData;
+  preserveVertexColors = false;
 
   private readonly historyLimit: number;
   private readonly weightByVertex: Float32Array;
@@ -25,8 +26,11 @@ export class SculptEngine {
   private readonly sortedVertices: Uint32Array;
   private readonly smoothBufferA: Float32Array;
   private readonly smoothBufferB: Float32Array;
+  private readonly boundaryNeighborOffsets: Uint32Array;
+  private readonly boundaryNeighbors: Uint32Array;
   private readonly strokeVertexMarks: Uint32Array;
   private readonly activeVertexMarks: Uint32Array;
+  private readonly supportVertexMarks: Uint32Array;
 
   private readonly triangleScratch = new Triangle();
   private readonly triA = new Vector3();
@@ -41,6 +45,7 @@ export class SculptEngine {
   private strokeBeforePositions: number[] = [];
   private strokeVertexStamp = 1;
   private activeVertexStamp = 1;
+  private supportVertexStamp = 1;
   private regionTriangleStamp = 1;
   private regionVertexStamp = 1;
   private dirtyFaceStamp = 1;
@@ -54,8 +59,12 @@ export class SculptEngine {
     this.sortedVertices = new Uint32Array(data.vertexCount);
     this.smoothBufferA = new Float32Array(data.positions.length);
     this.smoothBufferB = new Float32Array(data.positions.length);
+    const boundaryNeighbors = buildBoundaryNeighborAdjacency(data.indices, data.positions, data.vertexCount);
+    this.boundaryNeighborOffsets = boundaryNeighbors.offsets;
+    this.boundaryNeighbors = boundaryNeighbors.values;
     this.strokeVertexMarks = new Uint32Array(data.vertexCount);
     this.activeVertexMarks = new Uint32Array(data.vertexCount);
+    this.supportVertexMarks = new Uint32Array(data.vertexCount);
   }
 
   getHistoryState(): HistoryState {
@@ -146,7 +155,13 @@ export class SculptEngine {
       return false;
     }
 
-    const activeCount = this.populateActiveVertices(stamp, region.vertexCount);
+    let activeCount = this.populateActiveVertices(stamp, region.vertexCount);
+    let trimlineBoundaryCount = activeCount;
+    if (stamp.type === 'smooth' && stamp.smoothOnlyTrimline) {
+      const trimlineCounts = this.partitionTrimlineBrushVertices(activeCount);
+      trimlineBoundaryCount = trimlineCounts.boundaryCount;
+      activeCount = trimlineCounts.totalCount;
+    }
     if (activeCount === 0) {
       return false;
     }
@@ -155,7 +170,12 @@ export class SculptEngine {
 
     switch (stamp.type) {
       case 'smooth':
-        this.applySmooth(stamp, activeCount);
+        if (stamp.smoothOnlyTrimline) {
+          this.applyTrimlineSmooth(stamp, trimlineBoundaryCount);
+          this.applyTrimlineSupportSmooth(stamp, trimlineBoundaryCount, activeCount);
+        } else {
+          this.applySmooth(stamp, activeCount);
+        }
         break;
       case 'inflate':
         this.applyNormalDisplacement(stamp, activeCount, 1);
@@ -167,20 +187,24 @@ export class SculptEngine {
         this.applyFlatten(stamp, activeCount);
         break;
     }
-    this.synchronizeActivePositionGroups(activeCount);
+    if (!(stamp.type === 'smooth' && stamp.smoothOnlyTrimline)) {
+      this.synchronizeActivePositionGroups(activeCount);
+    }
 
     const dirtyVertexCount = this.recomputeLocalNormals(activeCount);
     this.markAttributeRanges(this.data.positionAttribute, this.activeVertices, activeCount);
     this.markAttributeRanges(this.data.normalAttribute, this.data.dirtyVertices, dirtyVertexCount);
-    recomputeDisplacementColorsForVertices(
-      this.data.positions,
-      this.data.referencePositions,
-      this.data.normals,
-      this.data.colors,
-      this.data.dirtyVertices,
-      dirtyVertexCount,
-    );
-    this.markAttributeRanges(this.data.colorAttribute, this.data.dirtyVertices, dirtyVertexCount);
+    if (!this.preserveVertexColors) {
+      recomputeDisplacementColorsForVertices(
+        this.data.positions,
+        this.data.referencePositions,
+        this.data.normals,
+        this.data.colors,
+        this.data.dirtyVertices,
+        dirtyVertexCount,
+      );
+      this.markAttributeRanges(this.data.colorAttribute, this.data.dirtyVertices, dirtyVertexCount);
+    }
     this.data.geometry.boundsTree?.refit();
     return true;
   }
@@ -346,6 +370,33 @@ export class SculptEngine {
     }
   }
 
+  private partitionTrimlineBrushVertices(activeCount: number): { boundaryCount: number; totalCount: number } {
+    let boundaryCount = 0;
+    let supportCount = 0;
+    for (let i = 0; i < activeCount; i += 1) {
+      const vertex = this.activeVertices[i];
+      if (this.boundaryNeighborOffsets[vertex + 1] === this.boundaryNeighborOffsets[vertex]) {
+        this.sortedVertices[supportCount] = vertex;
+        supportCount += 1;
+        continue;
+      }
+
+      this.activeVertices[boundaryCount] = vertex;
+      boundaryCount += 1;
+    }
+
+    if (boundaryCount === 0) {
+      for (let i = 0; i < supportCount; i += 1) {
+        this.weightByVertex[this.sortedVertices[i]] = 0;
+      }
+
+      return { boundaryCount: 0, totalCount: 0 };
+    }
+
+    this.activeVertices.set(this.sortedVertices.subarray(0, supportCount), boundaryCount);
+    return { boundaryCount, totalCount: boundaryCount + supportCount };
+  }
+
   private applyNormalDisplacement(stamp: BrushStamp, activeCount: number, direction: 1 | -1): void {
     const { positions, normals } = this.data;
     const amplitude = stamp.radius * stamp.strength * NORMAL_DISPLACEMENT_SCALE * direction;
@@ -454,6 +505,205 @@ export class SculptEngine {
         this.smoothBufferB[offset + 1] + (sumY * invCount - this.smoothBufferB[offset + 1]) * mu;
       positions[offset + 2] =
         this.smoothBufferB[offset + 2] + (sumZ * invCount - this.smoothBufferB[offset + 2]) * mu;
+    }
+
+    this.relaxActiveBoundaryVertices(stamp, activeCount);
+  }
+
+  private applyTrimlineSmooth(stamp: BrushStamp, activeCount: number): void {
+    const { positions, normals } = this.data;
+
+    for (let i = 0; i < activeCount; i += 1) {
+      const vertex = this.activeVertices[i];
+      const offset = vertex * 3;
+      this.smoothBufferA[offset] = positions[offset];
+      this.smoothBufferA[offset + 1] = positions[offset + 1];
+      this.smoothBufferA[offset + 2] = positions[offset + 2];
+    }
+
+    for (let i = 0; i < activeCount; i += 1) {
+      const vertex = this.activeVertices[i];
+      const start = this.boundaryNeighborOffsets[vertex];
+      const end = this.boundaryNeighborOffsets[vertex + 1];
+      const neighborCount = end - start;
+      const offset = vertex * 3;
+      if (neighborCount === 0) {
+        continue;
+      }
+
+      let sumX = 0;
+      let sumY = 0;
+      let sumZ = 0;
+      for (let neighborOffset = start; neighborOffset < end; neighborOffset += 1) {
+        const neighbor = this.boundaryNeighbors[neighborOffset];
+        const neighborPosition = neighbor * 3;
+        const source =
+          this.activeVertexMarks[neighbor] === this.activeVertexStamp && this.weightByVertex[neighbor] > 0
+            ? this.smoothBufferA
+            : positions;
+        sumX += source[neighborPosition];
+        sumY += source[neighborPosition + 1];
+        sumZ += source[neighborPosition + 2];
+      }
+
+      const invCount = 1 / neighborCount;
+      const targetX = sumX * invCount;
+      const targetY = sumY * invCount;
+      const targetZ = sumZ * invCount;
+      const deltaX = targetX - this.smoothBufferA[offset];
+      const deltaY = targetY - this.smoothBufferA[offset + 1];
+      const deltaZ = targetZ - this.smoothBufferA[offset + 2];
+      const normalX = normals[offset];
+      const normalY = normals[offset + 1];
+      const normalZ = normals[offset + 2];
+      const normalLengthSq = normalX * normalX + normalY * normalY + normalZ * normalZ;
+      let adjustedX = deltaX;
+      let adjustedY = deltaY;
+      let adjustedZ = deltaZ;
+      if (normalLengthSq > 1e-12) {
+        const invNormalLengthSq = 1 / normalLengthSq;
+        const normalDelta = (deltaX * normalX + deltaY * normalY + deltaZ * normalZ) * invNormalLengthSq;
+        const normalDeltaX = normalX * normalDelta;
+        const normalDeltaY = normalY * normalDelta;
+        const normalDeltaZ = normalZ * normalDelta;
+        adjustedX = deltaX - normalDeltaX * 0.75;
+        adjustedY = deltaY - normalDeltaY * 0.75;
+        adjustedZ = deltaZ - normalDeltaZ * 0.75;
+      }
+
+      const weight = Math.min(this.weightByVertex[vertex] * stamp.strength * 1.45, 0.9);
+      positions[offset] = this.smoothBufferA[offset] + adjustedX * weight;
+      positions[offset + 1] = this.smoothBufferA[offset + 1] + adjustedY * weight;
+      positions[offset + 2] = this.smoothBufferA[offset + 2] + adjustedZ * weight;
+    }
+  }
+
+  private applyTrimlineSupportSmooth(stamp: BrushStamp, start: number, end: number): void {
+    if (end <= start) {
+      return;
+    }
+
+    const { positions, vertexNeighborOffsets, vertexNeighbors } = this.data;
+    this.supportVertexStamp = nextStamp(this.supportVertexMarks, this.supportVertexStamp);
+
+    for (let i = start; i < end; i += 1) {
+      const vertex = this.activeVertices[i];
+      this.supportVertexMarks[vertex] = this.supportVertexStamp;
+      const offset = vertex * 3;
+      this.smoothBufferA[offset] = positions[offset];
+      this.smoothBufferA[offset + 1] = positions[offset + 1];
+      this.smoothBufferA[offset + 2] = positions[offset + 2];
+    }
+
+    for (let i = start; i < end; i += 1) {
+      const vertex = this.activeVertices[i];
+      const offset = vertex * 3;
+      const weight = Math.min(this.weightByVertex[vertex] * stamp.strength * SMOOTH_LAMBDA, 0.95);
+
+      let sumX = 0;
+      let sumY = 0;
+      let sumZ = 0;
+      let count = 0;
+
+      for (
+        let neighborOffset = vertexNeighborOffsets[vertex];
+        neighborOffset < vertexNeighborOffsets[vertex + 1];
+        neighborOffset += 1
+      ) {
+        const neighbor = vertexNeighbors[neighborOffset];
+        const neighborPosition = neighbor * 3;
+        sumX += positions[neighborPosition];
+        sumY += positions[neighborPosition + 1];
+        sumZ += positions[neighborPosition + 2];
+        count += 1;
+      }
+
+      if (count === 0) {
+        this.smoothBufferB[offset] = this.smoothBufferA[offset];
+        this.smoothBufferB[offset + 1] = this.smoothBufferA[offset + 1];
+        this.smoothBufferB[offset + 2] = this.smoothBufferA[offset + 2];
+        continue;
+      }
+
+      const invCount = 1 / count;
+      this.smoothBufferB[offset] =
+        this.smoothBufferA[offset] + (sumX * invCount - this.smoothBufferA[offset]) * weight;
+      this.smoothBufferB[offset + 1] =
+        this.smoothBufferA[offset + 1] + (sumY * invCount - this.smoothBufferA[offset + 1]) * weight;
+      this.smoothBufferB[offset + 2] =
+        this.smoothBufferA[offset + 2] + (sumZ * invCount - this.smoothBufferA[offset + 2]) * weight;
+    }
+
+    for (let i = start; i < end; i += 1) {
+      const vertex = this.activeVertices[i];
+      const offset = vertex * 3;
+      const weight = Math.min(this.weightByVertex[vertex] * stamp.strength, 0.95);
+      const mu = SMOOTH_MU * weight;
+
+      let sumX = 0;
+      let sumY = 0;
+      let sumZ = 0;
+      let count = 0;
+
+      for (
+        let neighborOffset = vertexNeighborOffsets[vertex];
+        neighborOffset < vertexNeighborOffsets[vertex + 1];
+        neighborOffset += 1
+      ) {
+        const neighbor = vertexNeighbors[neighborOffset];
+        const source = this.supportVertexMarks[neighbor] === this.supportVertexStamp ? this.smoothBufferB : positions;
+        const neighborPosition = neighbor * 3;
+        sumX += source[neighborPosition];
+        sumY += source[neighborPosition + 1];
+        sumZ += source[neighborPosition + 2];
+        count += 1;
+      }
+
+      if (count === 0) {
+        positions[offset] = this.smoothBufferB[offset];
+        positions[offset + 1] = this.smoothBufferB[offset + 1];
+        positions[offset + 2] = this.smoothBufferB[offset + 2];
+        continue;
+      }
+
+      const invCount = 1 / count;
+      positions[offset] =
+        this.smoothBufferB[offset] + (sumX * invCount - this.smoothBufferB[offset]) * mu;
+      positions[offset + 1] =
+        this.smoothBufferB[offset + 1] + (sumY * invCount - this.smoothBufferB[offset + 1]) * mu;
+      positions[offset + 2] =
+        this.smoothBufferB[offset + 2] + (sumZ * invCount - this.smoothBufferB[offset + 2]) * mu;
+    }
+  }
+
+  private relaxActiveBoundaryVertices(stamp: BrushStamp, activeCount: number): void {
+    const { positions } = this.data;
+
+    for (let i = 0; i < activeCount; i += 1) {
+      const vertex = this.activeVertices[i];
+      const start = this.boundaryNeighborOffsets[vertex];
+      const end = this.boundaryNeighborOffsets[vertex + 1];
+      const neighborCount = end - start;
+      if (neighborCount < 2) {
+        continue;
+      }
+
+      let sumX = 0;
+      let sumY = 0;
+      let sumZ = 0;
+      for (let neighborOffset = start; neighborOffset < end; neighborOffset += 1) {
+        const neighborPosition = this.boundaryNeighbors[neighborOffset] * 3;
+        sumX += positions[neighborPosition];
+        sumY += positions[neighborPosition + 1];
+        sumZ += positions[neighborPosition + 2];
+      }
+
+      const offset = vertex * 3;
+      const invCount = 1 / neighborCount;
+      const weight = Math.min(this.weightByVertex[vertex] * stamp.strength * 1.45, 0.9);
+      positions[offset] += (sumX * invCount - positions[offset]) * weight;
+      positions[offset + 1] += (sumY * invCount - positions[offset + 1]) * weight;
+      positions[offset + 2] += (sumZ * invCount - positions[offset + 2]) * weight;
     }
   }
 
@@ -734,15 +984,17 @@ export class SculptEngine {
     const dirtyVertexCount = this.recomputeNormalsForVertexSet(vertexIds);
     this.markAttributeRanges(this.data.positionAttribute, vertexIds, vertexIds.length);
     this.markAttributeRanges(this.data.normalAttribute, this.data.dirtyVertices, dirtyVertexCount);
-    recomputeDisplacementColorsForVertices(
-      this.data.positions,
-      this.data.referencePositions,
-      this.data.normals,
-      this.data.colors,
-      this.data.dirtyVertices,
-      dirtyVertexCount,
-    );
-    this.markAttributeRanges(this.data.colorAttribute, this.data.dirtyVertices, dirtyVertexCount);
+    if (!this.preserveVertexColors) {
+      recomputeDisplacementColorsForVertices(
+        this.data.positions,
+        this.data.referencePositions,
+        this.data.normals,
+        this.data.colors,
+        this.data.dirtyVertices,
+        dirtyVertexCount,
+      );
+      this.markAttributeRanges(this.data.colorAttribute, this.data.dirtyVertices, dirtyVertexCount);
+    }
     this.data.geometry.boundsTree?.refit();
   }
 
@@ -791,4 +1043,110 @@ function cloneStrokeRecord(record: StrokeRecord): StrokeRecord {
     beforePositions: record.beforePositions.slice(),
     afterPositions: record.afterPositions.slice(),
   };
+}
+
+function buildBoundaryNeighborAdjacency(
+  indices: Uint32Array,
+  positions: Float32Array,
+  vertexCount: number,
+): { offsets: Uint32Array; values: Uint32Array } {
+  const positionGroups = buildCanonicalVertexGroups(positions, vertexCount);
+  const edgeCounts = new Map<string, { a: number; b: number; count: number }>();
+  for (let triangle = 0; triangle < indices.length; triangle += 3) {
+    addEdge(indices[triangle], indices[triangle + 1], edgeCounts, positionGroups.canonicalByVertex);
+    addEdge(indices[triangle + 1], indices[triangle + 2], edgeCounts, positionGroups.canonicalByVertex);
+    addEdge(indices[triangle + 2], indices[triangle], edgeCounts, positionGroups.canonicalByVertex);
+  }
+
+  const neighborSets = Array.from({ length: vertexCount }, () => new Set<number>());
+  for (const edge of edgeCounts.values()) {
+    if (edge.count !== 1) {
+      continue;
+    }
+
+    const groupA = positionGroups.groupsByCanonical.get(edge.a) ?? [edge.a];
+    const groupB = positionGroups.groupsByCanonical.get(edge.b) ?? [edge.b];
+    for (let aIndex = 0; aIndex < groupA.length; aIndex += 1) {
+      const a = groupA[aIndex];
+      for (let bIndex = 0; bIndex < groupB.length; bIndex += 1) {
+        const b = groupB[bIndex];
+        if (a === b) {
+          continue;
+        }
+
+        neighborSets[a].add(b);
+        neighborSets[b].add(a);
+      }
+    }
+  }
+
+  const offsets = new Uint32Array(vertexCount + 1);
+  for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+    offsets[vertex + 1] = offsets[vertex] + neighborSets[vertex].size;
+  }
+
+  const values = new Uint32Array(offsets[vertexCount]);
+  for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+    values.set(Array.from(neighborSets[vertex]), offsets[vertex]);
+  }
+
+  return { offsets, values };
+}
+
+function addEdge(
+  a: number,
+  b: number,
+  edgeCounts: Map<string, { a: number; b: number; count: number }>,
+  canonicalByVertex: Uint32Array,
+): void {
+  if (a === b) {
+    return;
+  }
+
+  const canonicalA = canonicalByVertex[a];
+  const canonicalB = canonicalByVertex[b];
+  if (canonicalA === canonicalB) {
+    return;
+  }
+
+  const low = Math.min(canonicalA, canonicalB);
+  const high = Math.max(canonicalA, canonicalB);
+  const key = `${low}:${high}`;
+  const existing = edgeCounts.get(key);
+  if (existing) {
+    existing.count += 1;
+    return;
+  }
+
+  edgeCounts.set(key, { a: low, b: high, count: 1 });
+}
+
+function buildCanonicalVertexGroups(
+  positions: Float32Array,
+  vertexCount: number,
+): { canonicalByVertex: Uint32Array; groupsByCanonical: Map<number, number[]> } {
+  const canonicalByVertex = new Uint32Array(vertexCount);
+  const canonicalByPosition = new Map<string, number>();
+  const groupsByCanonical = new Map<number, number[]>();
+
+  for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+    const offset = vertex * 3;
+    const key = makePositionKey(positions[offset], positions[offset + 1], positions[offset + 2]);
+    const existing = canonicalByPosition.get(key);
+    if (existing !== undefined) {
+      canonicalByVertex[vertex] = existing;
+      groupsByCanonical.get(existing)?.push(vertex);
+      continue;
+    }
+
+    canonicalByPosition.set(key, vertex);
+    canonicalByVertex[vertex] = vertex;
+    groupsByCanonical.set(vertex, [vertex]);
+  }
+
+  return { canonicalByVertex, groupsByCanonical };
+}
+
+function makePositionKey(x: number, y: number, z: number): string {
+  return `${x.toFixed(5)},${y.toFixed(5)},${z.toFixed(5)}`;
 }

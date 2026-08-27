@@ -1,6 +1,6 @@
 # NouraSoft
 
-Browser-based mesh sculpting focused on responsive local editing. The app loads local `STL` and `OBJ` meshes, then offers Smooth sculpting by default.
+Browser and Windows desktop mesh editing focused on responsive local workflows. NouraSoft loads local `STL` and `OBJ` meshes and provides sculpting, selection editing, hole filling, remeshing, thickening, limb workflows, measurements, and `STL`/`OBJ` export.
 
 ## Setup
 
@@ -10,6 +10,23 @@ npm run dev
 ```
 
 Open the Vite URL in a browser, then use **Open STL / OBJ** to load a local mesh.
+
+## Windows Desktop App
+
+The Electron shell uses the same Vite/Three.js renderer as the browser app.
+
+```bash
+npm run desktop:dev
+```
+
+Build an unpacked Windows application or distributable installer and zip with:
+
+```bash
+npm run desktop:pack
+npm run desktop:dist
+```
+
+Generated desktop artifacts are written to `release/`. Keep that directory out of Git and publish installers as GitHub Release assets. See [docs/electron-desktop.md](docs/electron-desktop.md) for details.
 
 ## Access From Other Devices
 
@@ -72,6 +89,10 @@ Because this app is client-side only, that hosted site stays free and does not n
 - `Delete`: delete the selected faces
 - `Fill Hole`: inspect open loops in blue, hover a clean boundary in purple, then left click to patch it
 - `Smooth`: local Taubin-style smoothing over the affected region
+- `Remesh`: remesh the whole surface or a selected region at a chosen target edge size
+- `Thicken`: add shell thickness to the current mesh
+- `Positive Limb`: guide a remesh-and-extrude workflow from a selected open boundary
+- `Export`: save the edited mesh as `STL` or `OBJ`, with selectable coordinate units
 - `Undo / Redo`: restores recent strokes from a short ring buffer
 - `Reset View`: frames the loaded mesh again
 
@@ -82,15 +103,15 @@ Because this app is client-side only, that hosted site stays free and does not n
 3. The editable mesh keeps `position` and `normal` typed arrays as the authoritative data used by both the sculpt engine and the Three.js geometry attributes.
 4. `three-mesh-bvh` builds one BVH after load. Brush picking uses `firstHitOnly` raycasts, and edits call `boundsTree.refit()` instead of rebuilding the tree every mouse move.
 5. Each brush stamp flood-fills locally from the hit triangle, edits only the touched region, recomputes face normals only for dirty faces, then recomputes vertex normals only for dirty vertices before marking sparse GPU update ranges.
-6. Selection mode tracks selected triangle ids in a mask, renders them with a deep-purple overlay mesh, and rebuilds the editable mesh only when faces are explicitly deleted.
+6. Selection mode tracks selected triangle ids in a mask, renders them with a deep-purple overlay mesh, and rebuilds editable topology when operations such as delete or remesh are committed.
 
 ## Known Limitations
 
-- v1 edits one merged mesh at a time and ignores original materials.
-- There is no remeshing, topology change, painting, animation, or mesh export pipeline.
+- The editor operates on one merged mesh at a time; scene hierarchies and animation are not preserved.
+- Material handling is designed around the supported `OBJ` workflow rather than general-purpose scene formats.
 - Very thin shells or self-intersecting meshes can still allow some opposite-surface influence in edge cases.
 - Box and snip selection operate on visible triangle centroids, so selection is practical and Blender-like but not yet as exhaustive as a full GPU picking pass.
-- Performance is tuned for responsive local edits, but very dense meshes will still depend on browser and GPU limits. In practice, meshes in the low hundreds of thousands of triangles should feel workable on a modern desktop; beyond that, stroke density and browser overhead become the main constraint.
+- Performance is tuned for responsive local edits, but dense remesh and topology operations remain CPU-intensive and overall responsiveness depends on browser, CPU, and GPU limits.
 
 ## Hole Fill Notes
 

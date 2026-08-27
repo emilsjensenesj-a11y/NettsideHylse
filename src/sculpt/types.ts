@@ -23,6 +23,7 @@ export interface BrushStamp {
   radius: number;
   strength: number;
   type: BrushType;
+  smoothOnlyTrimline?: boolean;
 }
 
 export interface StrokeRecord {
@@ -57,12 +58,14 @@ export interface MeshStats {
 export interface MeasurementRow {
   distanceFromDistalMm: number;
   circumferenceMm: number;
+  zMm?: number;
 }
 
 export interface MeasurementState {
   rows: MeasurementRow[];
   totalHeightMm: number;
   clickedHeightMm: number | null;
+  pointToPointDistanceMm: number | null;
 }
 
 export interface HoleLoopSummary {

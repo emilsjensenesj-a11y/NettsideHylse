@@ -124,7 +124,7 @@ async function loadSelectedObjTexture(
     new TextureLoader().load(
       objectUrl,
       (texture) => {
-        texture.colorSpace = SRGBColorSpace;
+        configureObjDiffuseTexture(texture);
         resolve({ texture, file: textureFile });
       },
       undefined,
@@ -199,7 +199,7 @@ function extractFirstTexture(root: Group): Texture | null {
     for (const material of materials) {
       const candidate = (material as Material & { map?: Texture | null }).map ?? null;
       if (candidate) {
-        candidate.colorSpace = SRGBColorSpace;
+        configureObjDiffuseTexture(candidate);
         texture = candidate;
         return;
       }
@@ -207,6 +207,11 @@ function extractFirstTexture(root: Group): Texture | null {
   });
 
   return texture;
+}
+
+function configureObjDiffuseTexture(texture: Texture): void {
+  texture.colorSpace = SRGBColorSpace;
+  texture.needsUpdate = true;
 }
 
 function normalizeFileKey(path: string): string {
@@ -292,7 +297,7 @@ function normalizeGeometry(source: BufferGeometry, importUnit: MeshUnit): Buffer
   if (importScale !== 1) {
     geometry.scale(importScale, importScale, importScale);
   }
-  applyNouraScannerOrientation(geometry);
+  geometry.rotateZ(Math.PI / 2);
 
   geometry.computeBoundingBox();
   if (!geometry.boundingBox) {
@@ -342,11 +347,6 @@ function normalizeGeometry(source: BufferGeometry, importUnit: MeshUnit): Buffer
   }
 
   return welded;
-}
-
-function applyNouraScannerOrientation(geometry: BufferGeometry): void {
-  geometry.scale(1, -1, 1);
-  reverseTriangleWinding(geometry);
 }
 
 function reverseTriangleWinding(geometry: BufferGeometry): void {

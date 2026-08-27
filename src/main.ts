@@ -3,7 +3,12 @@ import './three-bvh';
 
 import { createEditableMeshData } from './sculpt/editable-mesh';
 import { loadMeshFile } from './io/mesh-loader';
-import { ViewportController, type MeshRotationAxis, type MeshViewMode } from './render/viewport';
+import {
+  ViewportController,
+  type MeshExportUnit,
+  type MeshRotationAxis,
+  type MeshViewMode,
+} from './render/viewport';
 import { SculptEngine } from './sculpt/sculpt-engine';
 import type {
   BoundaryWorkflowState,
@@ -15,6 +20,21 @@ import type {
   SelectionTool,
 } from './sculpt/types';
 
+interface DesktopExportFilePayload {
+  filename: string;
+  mimeType: string;
+  data: ArrayBuffer;
+}
+
+interface DesktopExportResult {
+  canceled: boolean;
+  filePaths?: string[];
+}
+
+interface NouraDesktopApi {
+  saveExportedFiles?: (request: { files: DesktopExportFilePayload[] }) => Promise<DesktopExportResult>;
+}
+
 const app = document.querySelector<HTMLDivElement>('#app');
 if (!app) {
   throw new Error('App root not found.');
@@ -24,7 +44,13 @@ app.innerHTML = `
   <div class="app-shell">
     <aside class="toolbar">
       <div class="panel-header">
-        <h1>NouraSoft</h1>
+        <img
+          id="brand-logo"
+          class="brand-logo"
+          src="./nourasoft-logo.png"
+          alt="NouraSoft"
+          data-fallbacks="./nourasoft-logo.jpg,./nourasoft-logo.jpeg,./nourasoft-logo.webp"
+        />
       </div>
 
       <p id="file-name" class="file-caption">No file loaded</p>
@@ -60,9 +86,9 @@ app.innerHTML = `
         <label class="field range-field">
           <span>Brush Radius</span>
           <div class="range-input-row">
-            <input id="radius-slider" type="range" min="0" max="100" step="0.1" value="12.5" />
+            <input id="radius-slider" type="range" min="0" max="100" step="1" value="13" />
             <label class="percent-input">
-              <input id="radius-input" class="number-input" type="number" min="0" max="100" step="0.1" value="12.5" />
+              <input id="radius-input" class="number-input" type="number" min="0" max="100" step="1" value="13" />
               <span>%</span>
             </label>
           </div>
@@ -78,6 +104,7 @@ app.innerHTML = `
             </label>
           </div>
         </label>
+        <button id="trimline-only-button" class="secondary-button" type="button" aria-pressed="false">Only Trimline</button>
       </div>
 
       <div id="selection-controls" class="control-group">
@@ -98,29 +125,27 @@ app.innerHTML = `
         <label id="selection-radius-field" class="field range-field">
           <span>Selection Radius</span>
           <div class="range-input-row">
-            <input id="selection-radius-slider" type="range" min="0" max="100" step="0.1" value="15" />
+            <input id="selection-radius-slider" type="range" min="0" max="100" step="1" value="15" />
             <label class="percent-input">
-              <input id="selection-radius-input" class="number-input" type="number" min="0" max="100" step="0.1" value="15" />
+              <input id="selection-radius-input" class="number-input" type="number" min="0" max="100" step="1" value="15" />
               <span>%</span>
             </label>
           </div>
         </label>
 
-        <label class="field range-field">
-          <span>Smooth Intensity <strong id="selection-smooth-strength-value">0.35</strong></span>
-          <input id="selection-smooth-strength-slider" type="range" min="0.05" max="1" step="0.01" value="0.35" />
-        </label>
-
         <div class="control-group split">
-          <button id="clear-selection-button" class="secondary-button" disabled>Deselect</button>
-          <button id="delete-selection-button" class="secondary-button" disabled>Delete Selected</button>
-        </div>
-
-        <div class="control-group">
-          <button id="smooth-selection-button" class="secondary-button" disabled>Smooth Selection</button>
+          <button id="clear-selection-button" class="secondary-button" disabled>Clear</button>
+          <button id="delete-selection-button" class="secondary-button" disabled>Delete</button>
         </div>
 
         <div class="archived-controls" hidden>
+          <button id="smooth-selection-button" class="secondary-button" disabled>Smooth Selection</button>
+
+          <label class="field range-field">
+            <span>Smooth Intensity <strong id="selection-smooth-strength-value">0.35</strong></span>
+            <input id="selection-smooth-strength-slider" type="range" min="0.05" max="1" step="0.01" value="0.35" />
+          </label>
+
           <label class="field range-field">
             <span>Smooth Iterations <strong id="selection-smooth-iterations-value">6</strong></span>
             <input id="selection-smooth-iterations-slider" type="range" min="1" max="20" step="1" value="6" />
@@ -144,7 +169,8 @@ app.innerHTML = `
       </div>
 
       <div id="positive-controls" class="control-group" hidden>
-        <div class="stepper-header">
+        <p id="positive-boundary-target-status" class="inline-note">Select an open edge to build the Positive Limb.</p>
+        <div class="stepper-header" hidden>
           <div>
             <p class="mini-heading">Positive Limb</p>
             <p id="positive-socket-step-label" class="inline-note">Step 1 of 9</p>
@@ -154,10 +180,9 @@ app.innerHTML = `
             <button id="positive-socket-next-button" class="secondary-button">Next</button>
           </div>
         </div>
-        <p id="positive-socket-step-title" class="inline-note">Full Mesh Remesh</p>
-        <p id="positive-boundary-target-status" class="inline-note">No boundary targeted yet.</p>
+        <p id="positive-socket-step-title" class="inline-note" hidden>Full Mesh Remesh</p>
 
-        <div id="positive-step-full-remesh" class="socket-step-panel control-group">
+        <div id="positive-step-full-remesh" class="socket-step-panel control-group" hidden>
           <p class="mini-heading">Full Mesh Remesh</p>
           <label class="field range-field">
             <span>Target Edge Size <strong id="positive-full-remesh-edge-value">0.250 mm</strong></span>
@@ -353,13 +378,7 @@ app.innerHTML = `
             </div>
           </div>
           <input id="file-input" type="file" accept=".stl,.obj,.mtl,.png,.jpg,.jpeg,.webp,.bmp" multiple hidden />
-          <div class="option-button-wrap">
-            <button id="export-button" class="secondary-button menu-bar-button" type="button" aria-expanded="false" aria-controls="export-menu" disabled>Export</button>
-            <div id="export-menu" class="option-menu" hidden>
-              <button id="export-stl-option" class="menu-button" type="button" disabled>Export STL</button>
-              <button id="export-obj-option" class="menu-button" type="button" disabled>Export OBJ</button>
-            </div>
-          </div>
+          <button id="export-button" class="secondary-button menu-bar-button" type="button" disabled>Export</button>
           <div class="option-button-wrap">
             <button id="view-button" class="secondary-button menu-bar-button" type="button" aria-expanded="false" aria-controls="view-menu">View</button>
             <div id="view-menu" class="option-menu" hidden>
@@ -396,14 +415,18 @@ app.innerHTML = `
           </div>
         </div>
         <div id="history-controls" class="viewport-menu-group">
+          <button id="dark-theme-button" class="secondary-button menu-bar-button theme-button" type="button" aria-pressed="false">Dark Theme</button>
           <button id="undo-button" class="secondary-button menu-bar-button" type="button" disabled>Undo</button>
           <button id="redo-button" class="secondary-button menu-bar-button" type="button" disabled>Redo</button>
         </div>
       </div>      <div id="viewport" class="viewport-host">
-        <div id="viewport-hints" class="viewport-hints">
+        <div id="viewport-hints" class="viewport-hints" data-collapsed="false">
+          <button id="toggle-controls-hint" class="controls-drawer-toggle" type="button" aria-label="Hide controls">
+            <span class="drawer-label">Controls</span>
+            <span id="controls-drawer-arrows" class="drawer-arrows">&lt;&lt;&lt;</span>
+          </button>
           <div class="viewport-hints-header">
             <strong>Controls</strong>
-            <button id="close-controls-hint" class="hint-close-button" type="button" aria-label="Close controls">x</button>
           </div>
           <p id="mode-hint-primary">Left drag smooths and right drag rotates.</p>
           <p id="mode-hint-secondary">Mouse wheel zooms and middle drag pans.</p>
@@ -419,12 +442,12 @@ app.innerHTML = `
           </button>
           <div class="viewcube-stage">
             <div id="view-cube" class="viewcube">
-              <button id="view-front" class="viewcube-face viewcube-face-front" data-direction="0,0,1" type="button">Front</button>
-              <button id="view-back" class="viewcube-face viewcube-face-back" data-direction="0,0,-1" type="button">Back</button>
-              <button id="view-left" class="viewcube-face viewcube-face-left" data-direction="-1,0,0" type="button">Left</button>
-              <button id="view-right" class="viewcube-face viewcube-face-right" data-direction="1,0,0" type="button">Right</button>
-              <button id="view-proximal" class="viewcube-face viewcube-face-top" data-direction="0,-1,0" type="button">Proximal</button>
-              <button id="view-distal" class="viewcube-face viewcube-face-bottom" data-direction="0,1,0" type="button">Distal</button>
+              <button id="view-front" class="viewcube-face viewcube-face-front" data-direction="0,-1,0" type="button">Front</button>
+              <button id="view-back" class="viewcube-face viewcube-face-back" data-direction="0,1,0" type="button">Back</button>
+              <button id="view-left" class="viewcube-face viewcube-face-left" data-direction="1,0,0" type="button">Left</button>
+              <button id="view-right" class="viewcube-face viewcube-face-right" data-direction="-1,0,0" type="button">Right</button>
+              <button id="view-proximal" class="viewcube-face viewcube-face-top" data-direction="0,0,1" type="button">Proximal</button>
+              <button id="view-distal" class="viewcube-face viewcube-face-bottom" data-direction="0,0,-1" type="button">Distal</button>
             </div>
           </div>
         </div>
@@ -436,12 +459,14 @@ app.innerHTML = `
           <div class="measurement-header">
             <div>
               <p class="mini-heading">Measurements</p>
-              <p class="inline-note">25 mm spacing from distal end</p>
+              <p class="inline-note">25 mm spacing along the Z proximal axis</p>
             </div>
           </div>
           <div class="measurement-actions">
-            <button id="toggle-circumference-button" class="secondary-button" type="button" disabled>Calculate Circumferences</button>
-            <button id="take-measurement-button" class="secondary-button" type="button" disabled>Take Measurement</button>
+            <button id="toggle-circumference-button" class="secondary-button" type="button" disabled>Show Measurements</button>
+            <button id="set-circumference-start-button" class="secondary-button" type="button" disabled>Set Starting Circumference</button>
+            <button id="take-measurement-button" class="secondary-button" type="button" disabled>Measure Height</button>
+            <button id="clear-measurement-button" class="secondary-button" type="button" disabled>Point-to-Point</button>
           </div>
           <div class="measurement-summary">
             <span>Total height</span>
@@ -453,7 +478,7 @@ app.innerHTML = `
             <table class="measurement-table">
               <thead>
                 <tr>
-                  <th>From distal</th>
+                  <th>Height</th>
                   <th>Circ.</th>
                 </tr>
               </thead>
@@ -465,20 +490,64 @@ app.innerHTML = `
             </table>
           </div>
         </aside>
+        <div id="positive-progress" class="positive-progress" hidden>
+          <div class="positive-progress-box">
+            <p class="mini-heading">Positive Limb</p>
+            <p id="positive-progress-message">Preparing mesh.</p>
+          </div>
+        </div>
+        <div id="operation-error-toast" class="operation-error-toast" role="alert" hidden>
+          <button id="operation-error-close" class="operation-error-close" type="button" aria-label="Dismiss error">x</button>
+          <p class="mini-heading">Action Failed</p>
+          <p id="operation-error-message">The action could not be completed.</p>
+        </div>
         <p id="status" class="status">Open a local STL or OBJ mesh to begin smoothing.</p>
       </div>
     </main>
   </div>
+  <dialog id="export-dialog" class="export-dialog" aria-labelledby="export-dialog-title">
+    <form id="export-form" class="export-form">
+      <div class="export-dialog-heading">
+        <p class="mini-heading">Mesh Export</p>
+        <h2 id="export-dialog-title">Choose format and units</h2>
+        <p>The imported geometry is always treated as millimetres. Exported coordinates are converted to the selected unit.</p>
+      </div>
+      <label class="export-field">
+        <span>File format</span>
+        <select id="export-format-select">
+          <option value="obj">OBJ + MTL + PNG</option>
+          <option value="stl">STL</option>
+        </select>
+      </label>
+      <label class="export-field">
+        <span>Coordinate unit</span>
+        <select id="export-unit-select">
+          <option value="mm">Millimetres (mm)</option>
+          <option value="cm">Centimetres (cm)</option>
+          <option value="m">Metres (m)</option>
+          <option value="in">Inches (in)</option>
+        </select>
+      </label>
+      <p class="export-unit-note">OBJ and STL are unitless formats. NouraSoft changes the coordinate values so one exported unit equals the unit selected above.</p>
+      <div class="export-dialog-actions">
+        <button id="export-cancel-button" class="secondary-button" type="button">Cancel</button>
+        <button class="primary-button" type="submit">Export</button>
+      </div>
+    </form>
+  </dialog>
 `;
 
 const importButton = requireElement<HTMLButtonElement>('import-button');
+const brandLogo = requireElement<HTMLImageElement>('brand-logo');
 const importMenu = requireElement<HTMLElement>('import-menu');
 const importFilesOption = requireElement<HTMLButtonElement>('import-files-option');
 const importFolderOption = requireElement<HTMLButtonElement>('import-folder-option');
 const exportButton = requireElement<HTMLButtonElement>('export-button');
-const exportMenu = requireElement<HTMLElement>('export-menu');
-const exportStlOption = requireElement<HTMLButtonElement>('export-stl-option');
-const exportObjOption = requireElement<HTMLButtonElement>('export-obj-option');
+const exportDialog = requireElement<HTMLDialogElement>('export-dialog');
+const exportForm = requireElement<HTMLFormElement>('export-form');
+const exportFormatSelect = requireElement<HTMLSelectElement>('export-format-select');
+const exportUnitSelect = requireElement<HTMLSelectElement>('export-unit-select');
+const exportCancelButton = requireElement<HTMLButtonElement>('export-cancel-button');
 const viewButton = requireElement<HTMLButtonElement>('view-button');
 const viewMenu = requireElement<HTMLElement>('view-menu');
 const viewModeButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-view-mode]'));
@@ -499,6 +568,7 @@ const radiusSlider = requireElement<HTMLInputElement>('radius-slider');
 const radiusInput = requireElement<HTMLInputElement>('radius-input');
 const strengthSlider = requireElement<HTMLInputElement>('strength-slider');
 const strengthInput = requireElement<HTMLInputElement>('strength-input');
+const trimlineOnlyButton = requireElement<HTMLButtonElement>('trimline-only-button');
 const selectionToolSelect = requireElement<HTMLSelectElement>('selection-tool-select');
 const selectVisibleToggle = requireElement<HTMLInputElement>('select-visible-toggle');
 const selectionRadiusField = requireElement<HTMLElement>('selection-radius-field');
@@ -581,14 +651,21 @@ const thickenSlider = requireElement<HTMLInputElement>('thicken-slider');
 const thickenValue = requireElement<HTMLElement>('thicken-value');
 const applyThickenButton = requireElement<HTMLButtonElement>('apply-thicken-button');
 const historyControls = requireElement<HTMLElement>('history-controls');
+const darkThemeButton = requireElement<HTMLButtonElement>('dark-theme-button');
 const undoButton = requireElement<HTMLButtonElement>('undo-button');
 const redoButton = requireElement<HTMLButtonElement>('redo-button');
 const sculptControls = requireElement<HTMLElement>('sculpt-controls');
 const selectionControls = requireElement<HTMLElement>('selection-controls');
 const fileName = requireElement<HTMLElement>('file-name');
 const status = requireElement<HTMLElement>('status');
+const positiveProgress = requireElement<HTMLElement>('positive-progress');
+const positiveProgressMessage = requireElement<HTMLElement>('positive-progress-message');
+const operationErrorToast = requireElement<HTMLElement>('operation-error-toast');
+const operationErrorClose = requireElement<HTMLButtonElement>('operation-error-close');
+const operationErrorMessage = requireElement<HTMLElement>('operation-error-message');
 const viewportHints = requireElement<HTMLElement>('viewport-hints');
-const closeControlsHintButton = requireElement<HTMLButtonElement>('close-controls-hint');
+const toggleControlsHintButton = requireElement<HTMLButtonElement>('toggle-controls-hint');
+const controlsDrawerArrows = requireElement<HTMLElement>('controls-drawer-arrows');
 const modeHintPrimary = requireElement<HTMLElement>('mode-hint-primary');
 const modeHintSecondary = requireElement<HTMLElement>('mode-hint-secondary');
 const modeHintTertiary = requireElement<HTMLElement>('mode-hint-tertiary');
@@ -597,7 +674,9 @@ const measurementPanel = requireElement<HTMLElement>('measurement-panel');
 const toggleMeasurementPanelButton = requireElement<HTMLButtonElement>('toggle-measurement-panel');
 const measurementDrawerArrows = requireElement<HTMLElement>('measurement-drawer-arrows');
 const toggleCircumferenceButton = requireElement<HTMLButtonElement>('toggle-circumference-button');
+const setCircumferenceStartButton = requireElement<HTMLButtonElement>('set-circumference-start-button');
 const takeMeasurementButton = requireElement<HTMLButtonElement>('take-measurement-button');
+const clearMeasurementButton = requireElement<HTMLButtonElement>('clear-measurement-button');
 const measurementTotalHeight = requireElement<HTMLElement>('measurement-total-height');
 const measurementClickHeight = requireElement<HTMLElement>('measurement-click-height');
 const measurementTableBody = requireElement<HTMLTableSectionElement>('measurement-table-body');
@@ -607,6 +686,11 @@ if (!viewCubeStage) {
   throw new Error('Expected ViewCube stage.');
 }
 const resetViewCubeButton = requireElement<HTMLButtonElement>('reset-view-cube');
+const uiTooltip = document.createElement('div');
+uiTooltip.id = 'ui-tooltip';
+uiTooltip.className = 'ui-tooltip';
+uiTooltip.hidden = true;
+document.body.append(uiTooltip);
 
 let currentFilename = 'No file loaded';
 let currentTextureFile: File | null = null;
@@ -615,11 +699,25 @@ let meshViewMode: MeshViewMode = 'colored';
 let rotateToolActive = false;
 let circumferenceOverlayVisible = false;
 let measurementPickActive = false;
+let pointToPointPickActive = false;
+let measurementStartPickActive = false;
+let measurementHoveredIndex: number | null = null;
+let trimlineOnlySmooth = false;
 const BRUSH_RADIUS_MAX_MM = 40;
-const DEFAULT_BRUSH_RADIUS_PERCENT = 5 / BRUSH_RADIUS_MAX_MM * 100;
+const DEFAULT_BRUSH_RADIUS_PERCENT = 13;
 const DEFAULT_BRUSH_STRENGTH_PERCENT = 35;
+const DARK_THEME_STORAGE_KEY = 'nourasoft-dark-theme';
+const EXPORT_FORMAT_STORAGE_KEY = 'nourasoft-export-format';
+const EXPORT_UNIT_STORAGE_KEY = 'nourasoft-export-unit';
+type MeshExportFormat = 'obj' | 'stl';
+let darkThemeEnabled = readDarkThemePreference();
+let lastExportFormat = readExportFormatPreference();
+let lastExportUnit = readExportUnitPreference();
 const SOCKET_MODEL_TARGET_STEP_INDEX = 0;
 const SOCKET_MODEL_BOUNDARY_SMOOTH_STEP_INDEX = 1;
+
+applyActionTooltips();
+attachTooltipEvents();
 const SOCKET_MODEL_REMESH_STEP_INDEX = 2;
 const SOCKET_MODEL_THICKEN_STEP_INDEX = 3;
 const SOCKET_MODEL_OFFSET_STEP_INDEX = 4;
@@ -677,19 +775,337 @@ const POSITIVE_SOCKET_STEP_PANELS = [
 ] as const;
 let positiveSocketStepIndex = 0;
 
+function applyActionTooltips(): void {
+  const tooltipsById: Record<string, string> = {
+    'import-button': 'Open scan import options.',
+    'import-files-option': 'Choose an STL or OBJ scan. For textured OBJ files, select the OBJ, MTL, and image together.',
+    'import-folder-option': 'Load an OBJ and its texture files from the same folder when browser support allows it.',
+    'export-button': 'Choose units and export the current mesh as STL or textured OBJ.',
+    'view-button': 'Switch how the scan is displayed in the viewport.',
+    'view-colored-option': 'Show the scan color or baked vertex color when available.',
+    'view-shaded-option': 'Show a neutral shaded surface for checking shape.',
+    'view-wireframe-option': 'Show triangle edges for technical inspection.',
+    'rotate-button': 'Rotate the mesh with live angle values or the on-model rotation rings.',
+    'rotate-x-input': 'Rotate around the X axis in degrees. Updates live.',
+    'rotate-y-input': 'Rotate around the Y axis in degrees. Updates live.',
+    'rotate-z-input': 'Rotate around the Z axis in degrees. Updates live.',
+    'dark-theme-button': 'Toggle the premium NOURA dark theme on or off.',
+    'undo-button': 'Undo the last mesh edit.',
+    'redo-button': 'Redo the last undone mesh edit.',
+    'radius-slider': 'Adjust the Smooth Brush radius. 100% equals 40 mm.',
+    'radius-input': 'Type the Smooth Brush radius as a percent of the 40 mm maximum.',
+    'strength-slider': 'Adjust how strongly the Smooth Brush relaxes the surface.',
+    'strength-input': 'Type Smooth Brush strength as a percent.',
+    'trimline-only-button': 'Limits Smooth Brush strokes to open trimline boundary vertices.',
+    'selection-tool-select': 'Choose the selection shape used to mark scan artifacts.',
+    'select-visible-toggle': 'Turn on to select through the scan. Leave off to select only the closest visible surface.',
+    'selection-radius-slider': 'Adjust the selection radius. 100% equals 40 mm.',
+    'selection-radius-input': 'Type the selection radius as a percent of the 40 mm maximum.',
+    'clear-selection-button': 'Clear the current selected faces without changing the mesh.',
+    'delete-selection-button': 'Delete the selected artifact faces from the scan.',
+    'smooth-selection-button': 'Archived tool: smooth only the selected faces.',
+    'selection-smooth-strength-slider': 'Archived setting: controls how aggressively selected faces are smoothed.',
+    'selection-smooth-iterations-slider': 'Archived setting: number of repeated smoothing passes.',
+    'selection-remesh-edge-slider': 'Archived setting: target triangle size for remeshing selected faces.',
+    'refine-selection-button': 'Archived tool: subdivide selected faces for denser editing.',
+    'smooth-boundary-button': 'Archived tool: smooth the boundary around a selection.',
+    'remesh-selection-button': 'Archived tool: rebuild selected faces with cleaner triangles.',
+    'positive-boundary-target-status': 'Positive Limb starts by selecting the open boundary edge of the scan.',
+    'positive-socket-prev-button': 'Go back to the previous archived Positive Limb step.',
+    'positive-socket-next-button': 'Continue the archived Positive Limb step sequence.',
+    'positive-full-remesh-edge-slider': 'Archived setting: full-scan remesh voxel size.',
+    'positive-boundary-smooth-strength-slider': 'Archived setting: smooths the selected open edge before building the limb.',
+    'positive-remesh-edge-slider': 'Archived setting: fixed-boundary remesh size.',
+    'positive-extrude-distance-slider': 'Archived setting: extrusion distance from the boundary.',
+    'positive-band-distance-slider': 'Archived setting: width of the offset band near the boundary.',
+    'positive-selected-smooth-strength-slider': 'Archived setting: relaxes the final selected band.',
+    'positive-directional-tilt-x-slider': 'Archived setting: tilt the final wall extrusion around X.',
+    'positive-directional-tilt-y-slider': 'Archived setting: tilt the final wall extrusion around Y.',
+    'boundary-target-status': 'Archived Socket Model status for the selected boundary.',
+    'socket-model-prev-button': 'Go back to the previous archived Socket Model step.',
+    'socket-model-next-button': 'Continue the archived Socket Model step sequence.',
+    'boundary-smooth-strength-slider': 'Archived setting: smooths the selected boundary.',
+    'boundary-remesh-edge-slider': 'Archived setting: fixed-boundary remesh size.',
+    'boundary-thicken-slider': 'Archived setting: socket shell thickness.',
+    'boundary-band-distance-slider': 'Archived setting: width of the offset band.',
+    'boundary-selected-smooth-strength-slider': 'Archived setting: relaxes the selected band.',
+    'remesh-edge-slider': 'Archived setting: target triangle size for whole-mesh remeshing.',
+    'remesh-boundary-select': 'Archived setting: controls how remesh treats open boundaries.',
+    'apply-remesh-button': 'Archived tool: rebuild the mesh triangle structure.',
+    'thicken-slider': 'Archived setting: shell offset distance.',
+    'apply-thicken-button': 'Archived tool: create shell thickness.',
+    'reset-view-cube': 'Return the viewport to the default home view.',
+    'view-front': 'Look at the front face of the scan.',
+    'view-back': 'Look at the back face of the scan.',
+    'view-left': 'Look at the left side of the scan.',
+    'view-right': 'Look at the right side of the scan.',
+    'view-proximal': 'Look from the proximal +Z direction.',
+    'view-distal': 'Look from the distal -Z direction.',
+    'toggle-controls-hint': 'Collapse or reopen the viewport controls guide.',
+    'toggle-measurement-panel': 'Collapse or reopen the Measurements panel.',
+    'toggle-circumference-button': 'Calculate and show circumference bands every 25 mm along +Z.',
+    'set-circumference-start-button': 'Pick where the first circumference band starts. The bands update live while hovering.',
+    'take-measurement-button': 'Preview and click to pin a vertical height measurement from the distal end to the point.',
+    'clear-measurement-button': 'Click two surface points to measure the direct distance between them.',
+  };
+  for (const [id, text] of Object.entries(tooltipsById)) {
+    setTooltipById(id, text);
+  }
+
+  const workflowTooltips: Partial<Record<InteractionMode, string>> = {
+    select: 'Select artifact faces so they can be cleared or deleted.',
+    fill: 'Patch open scan holes by clicking highlighted boundary loops.',
+    sculpt: 'Use the Smooth Brush to relax rough areas on the scan.',
+    positive: 'Select the open edge to build the Positive Limb automatically.',
+    boundary: 'Archived paid workflow for socket model generation.',
+    remesh: 'Archived tool for rebuilding mesh triangle layout.',
+    thicken: 'Archived tool for adding shell thickness.',
+  };
+  workflowStepButtons.forEach((button) => {
+    const mode = button.dataset.mode as InteractionMode | undefined;
+    const tooltip = mode ? workflowTooltips[mode] : undefined;
+    if (tooltip) {
+      setTooltip(button, tooltip);
+    }
+  });
+
+  [
+    'radius-slider',
+    'strength-slider',
+    'selection-tool-select',
+    'select-visible-toggle',
+    'selection-radius-slider',
+    'selection-smooth-strength-slider',
+    'selection-smooth-iterations-slider',
+    'selection-remesh-edge-slider',
+    'rotate-x-input',
+    'rotate-y-input',
+    'rotate-z-input',
+    'positive-full-remesh-edge-slider',
+    'positive-boundary-smooth-strength-slider',
+    'positive-remesh-edge-slider',
+    'positive-extrude-distance-slider',
+    'positive-band-distance-slider',
+    'positive-selected-smooth-strength-slider',
+    'positive-directional-tilt-x-slider',
+    'positive-directional-tilt-y-slider',
+    'boundary-smooth-strength-slider',
+    'boundary-remesh-edge-slider',
+    'boundary-thicken-slider',
+    'boundary-band-distance-slider',
+    'boundary-selected-smooth-strength-slider',
+    'remesh-edge-slider',
+    'remesh-boundary-select',
+    'thicken-slider',
+  ].forEach((id) => {
+    const text = tooltipsById[id];
+    if (text) {
+      setTooltipForClosestLabel(id, text);
+    }
+  });
+
+  document
+    .querySelectorAll<HTMLElement>(
+      '#fill-controls .inline-note, #positive-controls .inline-note, #boundary-controls .inline-note',
+    )
+    .forEach((element) => {
+      if (!element.dataset.tooltip) {
+        setTooltip(element, 'Instruction text for the current workflow step.');
+      }
+    });
+}
+
+function setTooltipById(id: string, text: string): void {
+  const element = document.getElementById(id);
+  if (element instanceof HTMLElement) {
+    setTooltip(element, text);
+  }
+}
+
+function setTooltipForClosestLabel(id: string, text: string): void {
+  const element = document.getElementById(id);
+  if (!(element instanceof HTMLElement)) {
+    return;
+  }
+
+  setTooltip(element, text);
+  const label = element.closest<HTMLElement>('label');
+  if (label) {
+    setTooltip(label, text);
+  }
+}
+
+function setTooltip(element: HTMLElement, text: string): void {
+  element.dataset.tooltip = text;
+}
+
+const TOOLTIP_HOVER_DELAY_MS = 1000;
+let activeTooltipTarget: HTMLElement | null = null;
+let tooltipHoverTimer: number | null = null;
+let pendingTooltipX = 0;
+let pendingTooltipY = 0;
+
+function attachTooltipEvents(): void {
+  document.addEventListener(
+    'pointerover',
+    (event) => {
+      const target = findTooltipTarget(event.target);
+      if (!target) {
+        return;
+      }
+
+      scheduleTooltip(target, event.clientX, event.clientY);
+    },
+    true,
+  );
+  document.addEventListener(
+    'pointermove',
+    (event) => {
+      if (!activeTooltipTarget) {
+        return;
+      }
+
+      pendingTooltipX = event.clientX;
+      pendingTooltipY = event.clientY;
+      if (!uiTooltip.hidden) {
+        positionTooltip(event.clientX, event.clientY);
+      }
+    },
+    true,
+  );
+  document.addEventListener(
+    'pointerout',
+    (event) => {
+      if (!activeTooltipTarget) {
+        return;
+      }
+
+      if (event.relatedTarget instanceof Node && activeTooltipTarget.contains(event.relatedTarget)) {
+        return;
+      }
+
+      hideTooltip();
+    },
+    true,
+  );
+  document.addEventListener(
+    'focusin',
+    (event) => {
+      const target = findTooltipTarget(event.target);
+      if (!target) {
+        return;
+      }
+
+      activeTooltipTarget = target;
+      const rect = target.getBoundingClientRect();
+      showTooltip(target, rect.left + rect.width * 0.5, rect.bottom);
+    },
+    true,
+  );
+  document.addEventListener('focusout', hideTooltip, true);
+}
+
+function findTooltipTarget(target: EventTarget | null): HTMLElement | null {
+  if (!(target instanceof Element)) {
+    return null;
+  }
+
+  return target.closest<HTMLElement>('[data-tooltip]');
+}
+
+function scheduleTooltip(target: HTMLElement, clientX: number, clientY: number): void {
+  pendingTooltipX = clientX;
+  pendingTooltipY = clientY;
+  if (activeTooltipTarget === target) {
+    return;
+  }
+
+  cancelTooltipTimer();
+  activeTooltipTarget = target;
+  uiTooltip.hidden = true;
+  tooltipHoverTimer = window.setTimeout(() => {
+    tooltipHoverTimer = null;
+    if (activeTooltipTarget === target) {
+      showTooltip(target, pendingTooltipX, pendingTooltipY);
+    }
+  }, TOOLTIP_HOVER_DELAY_MS);
+}
+
+function showTooltip(target: HTMLElement, clientX: number, clientY: number): void {
+  const text = target.dataset.tooltip;
+  if (!text) {
+    hideTooltip();
+    return;
+  }
+
+  uiTooltip.textContent = text;
+  uiTooltip.hidden = false;
+  positionTooltip(clientX, clientY);
+}
+
+function positionTooltip(clientX: number, clientY: number): void {
+  const margin = 10;
+  const offset = 14;
+  const rect = uiTooltip.getBoundingClientRect();
+  let x = clientX + offset;
+  let y = clientY + offset;
+
+  if (x + rect.width + margin > window.innerWidth) {
+    x = clientX - rect.width - offset;
+  }
+  if (y + rect.height + margin > window.innerHeight) {
+    y = clientY - rect.height - offset;
+  }
+
+  uiTooltip.style.left = `${Math.max(margin, x)}px`;
+  uiTooltip.style.top = `${Math.max(margin, y)}px`;
+}
+
+function cancelTooltipTimer(): void {
+  if (tooltipHoverTimer === null) {
+    return;
+  }
+
+  window.clearTimeout(tooltipHoverTimer);
+  tooltipHoverTimer = null;
+}
+
+function hideTooltip(): void {
+  cancelTooltipTimer();
+  activeTooltipTarget = null;
+  uiTooltip.hidden = true;
+}
+
 const viewport = new ViewportController(viewportHost, {
   onHistoryChange: updateHistoryButtons,
   onSelectionChange: updateSelectionUi,
   onBoundaryWorkflowChange: updateBoundaryWorkflowUi,
-  onBoundaryAction: ({ success, message }) => {
+  onBoundaryAction: ({ success, message, complete }) => {
     setStatus(message, !success);
-    if (success && modeSelect.value === 'positive') {
+    if (!success && modeSelect.value === 'positive') {
+      showOperationError('Positive Limb', message);
+    } else if (success && modeSelect.value === 'positive') {
+      hideOperationError();
+    }
+    if (success && complete && modeSelect.value === 'positive') {
       positiveSocketStepIndex = POSITIVE_SOCKET_COMPLETE_STEP_INDEX;
+      positiveBoundaryTargetStatus.textContent = 'Positive Limb complete.';
       syncPositiveSocketStepUi(false);
     }
   },
+  onPositiveLimbProgress: ({ visible, message }) => {
+    positiveProgress.hidden = !visible;
+    positiveProgressMessage.textContent = message;
+  },
   onMeshStatsChange: updateMeshStats,
-  onHoleFill: ({ success, message }) => setStatus(message, !success),
+  onHoleFill: ({ success, message }) => {
+    setStatus(message, !success);
+    if (!success) {
+      showOperationError('Fill Hole', message);
+    } else {
+      hideOperationError();
+    }
+  },
   onViewCubeTransform: (transform) => {
     viewCube.style.transform = transform;
   },
@@ -697,9 +1113,27 @@ const viewport = new ViewportController(viewportHost, {
   onMeasurementCaptured: (heightMm) => {
     setStatus(`Measured ${formatMillimeters(heightMm, 1)} from the clicked point down to the distal end.`);
   },
+  onPointToPointMeasurementCaptured: (distanceMm) => {
+    setStatus(`Measured ${formatMillimeters(distanceMm, 1)} between the two clicked points.`);
+  },
+  onPointToPointPickStateChange: (active) => {
+    pointToPointPickActive = active;
+    syncMeasurementControls();
+  },
+  onMeasurementStartCaptured: (heightMm) => {
+    setStatus(`Starting circumference set at ${formatMillimeters(heightMm, 1)} height.`);
+  },
   onMeasurementPickStateChange: (active) => {
     measurementPickActive = active;
     syncMeasurementControls();
+  },
+  onMeasurementStartPickStateChange: (active) => {
+    measurementStartPickActive = active;
+    syncMeasurementControls();
+  },
+  onMeasurementHoverChange: (rowIndex) => {
+    measurementHoveredIndex = rowIndex;
+    syncMeasurementHoverRows();
   },
   onMeasurementVisibilityChange: (visible) => {
     circumferenceOverlayVisible = visible;
@@ -707,11 +1141,17 @@ const viewport = new ViewportController(viewportHost, {
     updateMeasurementUi(viewport.getMeasurementState());
   },
   onRotationDraftChange: syncRotateInputs,
+  onMeshViewModeChange: (mode) => {
+    meshViewMode = mode;
+    syncViewMenuUi();
+  },
 });
 
+setDarkTheme(darkThemeEnabled, false);
 viewport.setBrushType('smooth');
 viewport.setBrushRadiusMm(radiusPercentToMillimeters(Number(radiusSlider.value)));
 viewport.setBrushStrength(percentToUnit(Number(strengthSlider.value)));
+viewport.setSmoothOnlyTrimline(trimlineOnlySmooth);
 viewport.setInteractionMode(modeSelect.value as InteractionMode);
 viewport.setSelectionTool(selectionToolSelect.value as SelectionTool);
 viewport.setSelectOnlyVisible(!selectVisibleToggle.checked);
@@ -727,6 +1167,21 @@ updateBoundaryWorkflowUi(viewport.getBoundaryWorkflowState());
 syncSocketModelStepUi();
 syncPositiveSocketStepUi();
 
+brandLogo.addEventListener('error', () => {
+  const fallbacks = brandLogo.dataset.fallbacks
+    ?.split(',')
+    .map((path) => path.trim())
+    .filter(Boolean) ?? [];
+  const [next, ...remaining] = fallbacks;
+  if (!next) {
+    brandLogo.dataset.missing = 'true';
+    return;
+  }
+
+  brandLogo.dataset.fallbacks = remaining.join(',');
+  brandLogo.src = next;
+});
+
 importButton.addEventListener('click', (event) => {
   event.stopPropagation();
   toggleOptionMenu(importMenu, importButton);
@@ -741,9 +1196,16 @@ importFolderOption.addEventListener('click', async () => {
   closeOptionMenus();
   await openObjFolder();
 });
-exportButton.addEventListener('click', (event) => {
-  event.stopPropagation();
-  toggleOptionMenu(exportMenu, exportButton);
+exportButton.addEventListener('click', () => {
+  if (!meshLoaded) {
+    return;
+  }
+
+  resetMeasurementActivity();
+  closeOptionMenus();
+  exportFormatSelect.value = lastExportFormat;
+  exportUnitSelect.value = lastExportUnit;
+  exportDialog.showModal();
 });
 viewButton.addEventListener('click', (event) => {
   event.stopPropagation();
@@ -751,6 +1213,7 @@ viewButton.addEventListener('click', (event) => {
 });
 viewModeButtons.forEach((button) => {
   button.addEventListener('click', () => {
+    resetMeasurementActivity();
     const nextMode = button.dataset.viewMode as MeshViewMode | undefined;
     if (!nextMode) {
       return;
@@ -770,6 +1233,9 @@ rotateButton.addEventListener('click', (event) => {
   }
 
   const shouldOpen = rotateMenu.hidden === true;
+  if (shouldOpen) {
+    resetMeasurementActivity();
+  }
   closeOptionMenus();
   rotateMenu.hidden = !shouldOpen;
   rotateButton.setAttribute('aria-expanded', shouldOpen ? 'true' : 'false');
@@ -783,63 +1249,173 @@ Object.values(rotateInputs).forEach((input) => {
     updateRotationDraftFromInputs(true);
   });
 });
-exportStlOption.addEventListener('click', () => {
+darkThemeButton.addEventListener('click', () => {
+  setDarkTheme(!darkThemeEnabled);
+});
+operationErrorClose.addEventListener('click', () => {
+  hideOperationError();
+});
+exportCancelButton.addEventListener('click', () => {
+  exportDialog.close();
+});
+exportDialog.addEventListener('click', (event) => {
+  if (event.target === exportDialog) {
+    exportDialog.close();
+  }
+});
+exportForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const format = isMeshExportFormat(exportFormatSelect.value) ? exportFormatSelect.value : 'obj';
+  const unit = isMeshExportUnit(exportUnitSelect.value) ? exportUnitSelect.value : 'mm';
+  lastExportFormat = format;
+  lastExportUnit = unit;
+  persistExportPreferences();
+  exportDialog.close();
+  void exportMesh(format, unit);
+});
+
+async function exportMesh(format: MeshExportFormat, unit: MeshExportUnit): Promise<void> {
   resetMeasurementActivity();
+  viewport.commitRotationDraft();
   closeOptionMenus();
-  const exported = viewport.exportStl(getExportBaseName());
-  if (!exported) {
-    setStatus('Load a mesh before exporting STL.', true);
+  const exportBaseName = getNouraDesktopApi()?.saveExportedFiles ? getExportBaseName() : promptForExportBaseName();
+  if (!exportBaseName) {
+    setStatus(`${format.toUpperCase()} export canceled.`);
     return;
   }
 
-  downloadBlob(exported.filename, exported.blob);
-  setStatus(`Exported ${exported.filename}.`);
-});
-exportObjOption.addEventListener('click', () => {
-  resetMeasurementActivity();
-  closeOptionMenus();
-  const exported = viewport.exportObj(getExportBaseName(), currentTextureFile?.name ?? null);
-  if (!exported) {
-    setStatus('Load a mesh before exporting OBJ.', true);
-    return;
-  }
+  try {
+    const exported =
+      format === 'stl'
+        ? viewport.exportStl(exportBaseName, unit)
+        : viewport.exportObj(exportBaseName, unit);
+    if (!exported) {
+      setStatus(`Load a mesh before exporting ${format.toUpperCase()}.`, true);
+      return;
+    }
 
-  for (const file of exported.files) {
-    downloadBlob(file.filename, file.blob);
-  }
-  if (exported.referencesTexture && currentTextureFile) {
-    downloadBlob(currentTextureFile.name, currentTextureFile);
-  }
+    const filesToSave = 'files' in exported ? exported.files : [exported];
+    const saved = await saveExportedBlobFiles(filesToSave);
+    if (!saved) {
+      setStatus(`${format.toUpperCase()} export canceled.`);
+      return;
+    }
 
-  setStatus(
-    exported.referencesTexture
-      ? 'Exported OBJ, MTL, and texture image.'
-      : 'Exported OBJ and MTL. No texture image was available for this scan.',
-  );
-});
+    const unitLabel = formatMeshExportUnit(unit);
+    setStatus(
+      format === 'obj'
+        ? `Exported OBJ, MTL, and PNG in ${unitLabel}; the OBJ contains no vertex colors.`
+        : `Exported STL coordinate values in ${unitLabel}.`,
+    );
+  } catch (error) {
+    setStatus(getExportErrorMessage(error, `Failed to export ${format.toUpperCase()}.`), true);
+  }
+}
 toggleCircumferenceButton.addEventListener('click', () => {
-  circumferenceOverlayVisible = !circumferenceOverlayVisible;
-  viewport.setMeasurementCircumferenceVisible(circumferenceOverlayVisible);
+  setRotateToolActive(false);
+  if (circumferenceOverlayVisible) {
+    circumferenceOverlayVisible = false;
+    viewport.setMeasurementCircumferenceVisible(false);
+    syncMeasurementControls();
+    updateMeasurementUi(viewport.getMeasurementState());
+    setStatus('Measurements hidden.');
+    return;
+  }
+
+  if (measurementStartPickActive) {
+    viewport.cancelMeasurementStartPick();
+  }
+  if (pointToPointPickActive) {
+    viewport.cancelPointToPointMeasurementPick();
+  }
+  circumferenceOverlayVisible = true;
+  viewport.setMeasurementCircumferenceVisible(true);
   syncMeasurementControls();
   updateMeasurementUi(viewport.getMeasurementState());
-  setStatus(circumferenceOverlayVisible ? 'Calculated circumference bands every 25 mm.' : 'Circumference measurements hidden.');
+  setStatus('Calculated circumference bands every 25 mm.');
 });
-takeMeasurementButton.addEventListener('click', () => {
+setCircumferenceStartButton.addEventListener('click', () => {
+  setRotateToolActive(false);
+  if (measurementStartPickActive) {
+    viewport.cancelMeasurementStartPick();
+    setStatus('Starting circumference selection canceled.');
+    return;
+  }
+
   if (measurementPickActive) {
     viewport.cancelMeasurementPick();
-    setStatus('Measurement canceled.');
+  }
+  if (pointToPointPickActive) {
+    viewport.cancelPointToPointMeasurementPick();
+  }
+
+  if (!viewport.beginMeasurementStartPick()) {
+    setStatus('Load a scan before setting the starting circumference.', true);
     return;
+  }
+
+  setStatus('Move over the scan to preview Z-axis circumference bands, then click to set the start.');
+});
+takeMeasurementButton.addEventListener('click', () => {
+  setRotateToolActive(false);
+  if (measurementPickActive) {
+    viewport.cancelMeasurementPick();
+    setStatus('Height measurement canceled.');
+    return;
+  }
+
+  if (measurementStartPickActive) {
+    viewport.cancelMeasurementStartPick();
+  }
+  if (pointToPointPickActive) {
+    viewport.cancelPointToPointMeasurementPick();
   }
 
   if (!viewport.beginMeasurementPick()) {
-    setStatus('Calculate circumferences before taking a height measurement.', true);
+    setStatus('Load a scan before taking a height measurement.', true);
     return;
   }
 
+  circumferenceOverlayVisible = true;
+  viewport.setMeasurementCircumferenceVisible(true);
+  syncMeasurementControls();
+  updateMeasurementUi(viewport.getMeasurementState());
   setStatus('Click the scan once to measure straight down to the distal end.');
 });
-closeControlsHintButton.addEventListener('click', () => {
-  viewportHints.hidden = true;
+clearMeasurementButton.addEventListener('click', () => {
+  setRotateToolActive(false);
+  if (pointToPointPickActive) {
+    viewport.cancelPointToPointMeasurementPick();
+    setStatus('Point-to-point measurement canceled.');
+    return;
+  }
+
+  if (measurementPickActive) {
+    viewport.cancelMeasurementPick();
+  }
+  if (measurementStartPickActive) {
+    viewport.cancelMeasurementStartPick();
+  }
+
+  if (!viewport.beginPointToPointMeasurementPick()) {
+    setStatus('Load a scan before taking a point-to-point measurement.', true);
+    return;
+  }
+
+  circumferenceOverlayVisible = true;
+  viewport.setMeasurementCircumferenceVisible(true);
+  syncMeasurementControls();
+  updateMeasurementUi(viewport.getMeasurementState());
+  setStatus('Click the first point on the scan, then click the second point to measure direct length.');
+});
+toggleControlsHintButton.addEventListener('click', () => {
+  const nextCollapsed = viewportHints.dataset.collapsed !== 'true';
+  viewportHints.dataset.collapsed = nextCollapsed ? 'true' : 'false';
+  controlsDrawerArrows.textContent = nextCollapsed ? '>>>' : '<<<';
+  toggleControlsHintButton.setAttribute(
+    'aria-label',
+    nextCollapsed ? 'Show controls' : 'Hide controls',
+  );
 });
 toggleMeasurementPanelButton.addEventListener('click', () => {
   const nextCollapsed = measurementPanel.dataset.collapsed !== 'true';
@@ -853,6 +1429,19 @@ toggleMeasurementPanelButton.addEventListener('click', () => {
 undoButton.addEventListener('click', () => {
   resetMeasurementActivity();
   viewport.undo();
+  if (modeSelect.value === 'positive') {
+    positiveSocketStepIndex = POSITIVE_SOCKET_FULL_REMESH_STEP_INDEX;
+    const summary = viewport.resetPositiveLimbPrompt();
+    syncPositiveSocketStepUi(false);
+    positiveBoundaryTargetStatus.textContent = 'Select an open edge to build the Positive Limb.';
+    if (!summary) {
+      setStatus('Positive Limb is active. Select an open edge to build it automatically.');
+    } else if (summary.loopCount === 0) {
+      setStatus('Positive Limb is active. No open edge loops were found.', true);
+    } else {
+      setStatus('Positive Limb is active. Select an open edge to build it automatically.');
+    }
+  }
 });
 redoButton.addEventListener('click', () => {
   resetMeasurementActivity();
@@ -913,7 +1502,6 @@ positiveSocketNextButton.addEventListener('click', () => {
   advancePositiveSocketStep();
 });
 resetViewCubeButton.addEventListener('click', () => {
-  resetMeasurementActivity();
   viewport.resetView();
 });
 
@@ -924,6 +1512,7 @@ workflowStepButtons.forEach((button) => {
       return;
     }
 
+    viewport.clearSelection();
     modeSelect.value = mode;
     modeSelect.dispatchEvent(new Event('change', { bubbles: true }));
   });
@@ -1047,6 +1636,7 @@ function activateViewCubeTarget(target: HTMLElement | null): void {
 
 modeSelect.addEventListener('change', () => {
   resetMeasurementActivity();
+  setRotateToolActive(false);
   const mode = modeSelect.value as InteractionMode;
   viewport.setInteractionMode(mode);
   syncModeUi();
@@ -1078,7 +1668,7 @@ modeSelect.addEventListener('change', () => {
     if (!meshLoaded) {
       setStatus('Load a mesh before using Positive Limb.');
     } else {
-      setStatus('Positive Limb is active. Press Next to run the full mesh remesh first.');
+      setStatus('Positive Limb is active. Select an open edge to build it automatically.');
     }
   }
 });
@@ -1111,6 +1701,14 @@ strengthInput.addEventListener('input', () => {
 });
 strengthInput.addEventListener('change', () => {
   syncBrushStrengthFromPercent(Number(strengthInput.value));
+});
+
+trimlineOnlyButton.addEventListener('click', () => {
+  trimlineOnlySmooth = !trimlineOnlySmooth;
+  viewport.setSmoothOnlyTrimline(trimlineOnlySmooth);
+  trimlineOnlyButton.dataset.active = trimlineOnlySmooth ? 'true' : 'false';
+  trimlineOnlyButton.setAttribute('aria-pressed', trimlineOnlySmooth ? 'true' : 'false');
+  setStatus(trimlineOnlySmooth ? 'Smooth Brush will only relax open trimline edges.' : 'Smooth Brush will relax the local surface.');
 });
 
 selectionToolSelect.addEventListener('change', () => {
@@ -1287,8 +1885,6 @@ document.addEventListener('click', (event) => {
   if (
     importButton.contains(target) ||
     importMenu.contains(target) ||
-    exportButton.contains(target) ||
-    exportMenu.contains(target) ||
     viewButton.contains(target) ||
     viewMenu.contains(target) ||
     rotateButton.contains(target) ||
@@ -1347,11 +1943,9 @@ function toggleOptionMenu(menu: HTMLElement, trigger: HTMLButtonElement): void {
 
 function closeOptionMenus(): void {
   importMenu.hidden = true;
-  exportMenu.hidden = true;
   viewMenu.hidden = true;
   rotateMenu.hidden = true;
   importButton.setAttribute('aria-expanded', 'false');
-  exportButton.setAttribute('aria-expanded', 'false');
   viewButton.setAttribute('aria-expanded', 'false');
   rotateButton.setAttribute('aria-expanded', 'false');
   setRotateToolActive(false);
@@ -1360,9 +1954,6 @@ function closeOptionMenus(): void {
 function setRotateToolActive(active: boolean): void {
   rotateToolActive = active && meshLoaded;
   rotateButton.dataset.active = rotateToolActive ? 'true' : 'false';
-  if (rotateToolActive) {
-    syncRotateInputs({ x: 0, y: 0, z: 0 });
-  }
   viewport.setRotationOverlayVisible(rotateToolActive);
   if (!rotateToolActive) {
     rotateMenu.hidden = true;
@@ -1402,24 +1993,42 @@ function syncRotateInputs(angles: Record<MeshRotationAxis, number>): void {
 }
 
 function resetMeasurementActivity(): void {
-  if (!circumferenceOverlayVisible && !measurementPickActive) {
+  if (rotateToolActive) {
+    setRotateToolActive(false);
+  }
+
+  if (
+    !circumferenceOverlayVisible &&
+    !measurementPickActive &&
+    !measurementStartPickActive &&
+    !pointToPointPickActive
+  ) {
     return;
   }
 
   circumferenceOverlayVisible = false;
   viewport.setMeasurementCircumferenceVisible(false);
   viewport.cancelMeasurementPick();
+  viewport.cancelMeasurementStartPick();
+  viewport.cancelPointToPointMeasurementPick();
+  viewport.clearPointToPointMeasurement();
   syncMeasurementControls();
   updateMeasurementUi(viewport.getMeasurementState());
 }
 
 function syncMeasurementControls(): void {
   toggleCircumferenceButton.disabled = !meshLoaded;
-  takeMeasurementButton.disabled = !meshLoaded || !circumferenceOverlayVisible;
-  toggleCircumferenceButton.textContent = circumferenceOverlayVisible ? 'Hide Circumferences' : 'Calculate Circumferences';
+  setCircumferenceStartButton.disabled = !meshLoaded;
+  takeMeasurementButton.disabled = !meshLoaded;
+  clearMeasurementButton.disabled = !meshLoaded;
+  toggleCircumferenceButton.textContent = circumferenceOverlayVisible ? 'Hide Measurements' : 'Show Measurements';
   toggleCircumferenceButton.dataset.active = circumferenceOverlayVisible ? 'true' : 'false';
-  takeMeasurementButton.textContent = measurementPickActive ? 'Cancel Measurement' : 'Take Measurement';
+  setCircumferenceStartButton.textContent = measurementStartPickActive ? 'Cancel Start' : 'Set Starting Circumference';
+  setCircumferenceStartButton.dataset.active = measurementStartPickActive ? 'true' : 'false';
+  takeMeasurementButton.textContent = measurementPickActive ? 'Cancel Height' : 'Measure Height';
   takeMeasurementButton.dataset.active = measurementPickActive ? 'true' : 'false';
+  clearMeasurementButton.textContent = pointToPointPickActive ? 'Cancel Point-to-Point' : 'Point-to-Point';
+  clearMeasurementButton.dataset.active = pointToPointPickActive ? 'true' : 'false';
 }
 
 function syncModeUi(): void {
@@ -1536,20 +2145,10 @@ function updateBoundaryWorkflowUi(state: BoundaryWorkflowState): void {
     boundaryTargetStatus.textContent = 'Socket Model is inactive.';
   }
 
-  if (state.hasSelectedBoundary) {
-    positiveBoundaryTargetStatus.textContent = `Targeted boundary: ${formatCount(state.selectedBoundaryEdgeCount)} loop vertices.`;
-  } else if (modeSelect.value === 'positive' && positiveSocketStepIndex >= POSITIVE_SOCKET_DIRECTIONAL_EXTRUDE_STEP_INDEX) {
-    positiveBoundaryTargetStatus.textContent = 'Band smooth complete. Adjust the X/Y tilt sliders and finish the final wall extrusion.';
-  } else if (state.extrudeApplied && !state.offsetApplied) {
-    positiveBoundaryTargetStatus.textContent = 'Positive extrusion complete. Move to Offset and apply the band plus the automatic remesh.';
-  } else if (state.remeshApplied && !state.extrudeApplied) {
-    positiveBoundaryTargetStatus.textContent = 'Fixed-boundary remesh complete. Move to Extrude next.';
-  } else if (state.smoothCommitted && !state.remeshApplied) {
-    positiveBoundaryTargetStatus.textContent = 'Boundary smooth committed. Move to Remesh next.';
-  } else if (state.offsetApplied) {
-    positiveBoundaryTargetStatus.textContent = `Offset and auto-remesh complete. ${formatCount(state.selectedTriangleCount)} faces are ready for the final smooth.`;
+  if (modeSelect.value === 'positive' && positiveSocketStepIndex === POSITIVE_SOCKET_COMPLETE_STEP_INDEX) {
+    positiveBoundaryTargetStatus.textContent = 'Positive Limb complete.';
   } else if (modeSelect.value === 'positive') {
-    positiveBoundaryTargetStatus.textContent = 'No boundary targeted yet.';
+    positiveBoundaryTargetStatus.textContent = 'Select an open edge to build the Positive Limb.';
   } else {
     positiveBoundaryTargetStatus.textContent = 'Positive Limb is inactive.';
   }
@@ -1566,8 +2165,6 @@ function updateMeshStats(stats: MeshStats): void {
   applyThickenButton.disabled = stats.triangleCount === 0;
   meshLoaded = stats.triangleCount > 0;
   exportButton.disabled = !meshLoaded;
-  exportStlOption.disabled = !meshLoaded;
-  exportObjOption.disabled = !meshLoaded;
   rotateButton.disabled = !meshLoaded;
   if (stats.triangleCount === 0) {
     fileName.textContent = 'No file loaded';
@@ -1584,6 +2181,81 @@ function updateMeshStats(stats: MeshStats): void {
   configureOperationSliders(stats.boundsRadius);
 }
 
+function readDarkThemePreference(): boolean {
+  try {
+    const storedPreference = window.localStorage.getItem(DARK_THEME_STORAGE_KEY);
+    return storedPreference === null ? true : storedPreference === 'true';
+  } catch {
+    return true;
+  }
+}
+
+function readExportFormatPreference(): MeshExportFormat {
+  try {
+    const storedPreference = window.localStorage.getItem(EXPORT_FORMAT_STORAGE_KEY);
+    return isMeshExportFormat(storedPreference) ? storedPreference : 'obj';
+  } catch {
+    return 'obj';
+  }
+}
+
+function readExportUnitPreference(): MeshExportUnit {
+  try {
+    const storedPreference = window.localStorage.getItem(EXPORT_UNIT_STORAGE_KEY);
+    return isMeshExportUnit(storedPreference) ? storedPreference : 'mm';
+  } catch {
+    return 'mm';
+  }
+}
+
+function persistExportPreferences(): void {
+  try {
+    window.localStorage.setItem(EXPORT_FORMAT_STORAGE_KEY, lastExportFormat);
+    window.localStorage.setItem(EXPORT_UNIT_STORAGE_KEY, lastExportUnit);
+  } catch {
+    // Export preference persistence is optional; exporting still works without storage.
+  }
+}
+
+function isMeshExportFormat(value: string | null): value is MeshExportFormat {
+  return value === 'obj' || value === 'stl';
+}
+
+function isMeshExportUnit(value: string | null): value is MeshExportUnit {
+  return value === 'mm' || value === 'cm' || value === 'm' || value === 'in';
+}
+
+function formatMeshExportUnit(unit: MeshExportUnit): string {
+  switch (unit) {
+    case 'cm':
+      return 'centimetres (cm)';
+    case 'm':
+      return 'metres (m)';
+    case 'in':
+      return 'inches (in)';
+    default:
+      return 'millimetres (mm)';
+  }
+}
+
+function setDarkTheme(enabled: boolean, shouldPersist = true): void {
+  darkThemeEnabled = enabled;
+  document.documentElement.dataset.theme = enabled ? 'dark' : 'light';
+  darkThemeButton.dataset.active = enabled ? 'true' : 'false';
+  darkThemeButton.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+  viewport.setUiTheme(enabled ? 'dark' : 'light');
+
+  if (!shouldPersist) {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(DARK_THEME_STORAGE_KEY, enabled ? 'true' : 'false');
+  } catch {
+    // Theme persistence is a convenience only; the toggle still works without storage.
+  }
+}
+
 function syncViewMenuUi(): void {
   viewModeButtons.forEach((button) => {
     const isActive = button.dataset.viewMode === meshViewMode;
@@ -1597,17 +2269,24 @@ function formatViewMode(mode: MeshViewMode): string {
 }
 
 function updateMeasurementUi(state: MeasurementState): void {
+  const measurementVisible =
+    circumferenceOverlayVisible ||
+    measurementPickActive ||
+    pointToPointPickActive ||
+    state.clickedHeightMm !== null ||
+    state.pointToPointDistanceMm !== null;
   measurementTotalHeight.textContent =
-    circumferenceOverlayVisible && state.totalHeightMm > 0 ? formatMillimeters(state.totalHeightMm, 1) : '--';
+    measurementVisible && state.totalHeightMm > 0 ? formatMillimeters(state.totalHeightMm, 1) : '--';
   measurementClickHeight.textContent =
-    circumferenceOverlayVisible
+    measurementVisible
       ? state.clickedHeightMm === null
         ? 'Click scan'
         : formatMillimeters(state.clickedHeightMm, 1)
-      : 'Calculate first';
+      : 'Take measurement';
 
   measurementTableBody.replaceChildren();
   if (!circumferenceOverlayVisible) {
+    measurementHoveredIndex = null;
     const row = document.createElement('tr');
     const cell = document.createElement('td');
     cell.colSpan = 2;
@@ -1618,6 +2297,7 @@ function updateMeasurementUi(state: MeasurementState): void {
   }
 
   if (state.rows.length === 0) {
+    measurementHoveredIndex = null;
     const row = document.createElement('tr');
     const cell = document.createElement('td');
     cell.colSpan = 2;
@@ -1627,8 +2307,25 @@ function updateMeasurementUi(state: MeasurementState): void {
     return;
   }
 
+  if (measurementHoveredIndex !== null && measurementHoveredIndex >= state.rows.length) {
+    measurementHoveredIndex = null;
+  }
+
   for (const measurement of state.rows) {
+    const index = state.rows.indexOf(measurement);
     const row = document.createElement('tr');
+    row.dataset.measurementIndex = String(index);
+    row.classList.toggle('is-hovered', measurementHoveredIndex === index);
+    row.addEventListener('mouseenter', () => {
+      measurementHoveredIndex = index;
+      viewport.setHoveredMeasurementIndex(index);
+      syncMeasurementHoverRows();
+    });
+    row.addEventListener('mouseleave', () => {
+      measurementHoveredIndex = null;
+      viewport.setHoveredMeasurementIndex(null);
+      syncMeasurementHoverRows();
+    });
     const distanceCell = document.createElement('td');
     const circumferenceCell = document.createElement('td');
     distanceCell.textContent = formatMillimeters(measurement.distanceFromDistalMm, 0);
@@ -1636,6 +2333,14 @@ function updateMeasurementUi(state: MeasurementState): void {
     row.append(distanceCell, circumferenceCell);
     measurementTableBody.append(row);
   }
+}
+
+function syncMeasurementHoverRows(): void {
+  measurementTableBody
+    .querySelectorAll<HTMLTableRowElement>('tr[data-measurement-index]')
+    .forEach((row) => {
+      row.classList.toggle('is-hovered', Number(row.dataset.measurementIndex) === measurementHoveredIndex);
+    });
 }
 
 function deleteSelectedFaces(): void {
@@ -1654,6 +2359,29 @@ function deleteSelectedFaces(): void {
 function setStatus(message: string, isError = false): void {
   status.textContent = message;
   status.dataset.state = isError ? 'error' : 'idle';
+}
+
+let operationErrorTimer: number | null = null;
+
+function showOperationError(action: string, detail: string): void {
+  const cleanDetail = detail.trim() || 'The action failed before it returned a detailed message.';
+  operationErrorMessage.textContent = `${action} failed: ${cleanDetail}`;
+  operationErrorToast.hidden = false;
+
+  if (operationErrorTimer !== null) {
+    window.clearTimeout(operationErrorTimer);
+  }
+  operationErrorTimer = window.setTimeout(() => {
+    hideOperationError();
+  }, 10000);
+}
+
+function hideOperationError(): void {
+  operationErrorToast.hidden = true;
+  if (operationErrorTimer !== null) {
+    window.clearTimeout(operationErrorTimer);
+    operationErrorTimer = null;
+  }
 }
 
 function previewBoundarySmoothFromUi(): void {
@@ -1890,10 +2618,14 @@ function advanceSocketModelStep(): void {
 
 function syncPositiveSocketStepUi(_shouldRefreshPreview = true): void {
   for (let i = 0; i < POSITIVE_SOCKET_STEP_PANELS.length; i += 1) {
-    POSITIVE_SOCKET_STEP_PANELS[i].hidden = i !== positiveSocketStepIndex;
+    POSITIVE_SOCKET_STEP_PANELS[i].hidden = true;
   }
 
-  positiveSocketStepLabel.textContent = `Step ${positiveSocketStepIndex + 1} of ${POSITIVE_SOCKET_STEP_PANELS.length}`;
+  positiveSocketStepLabel.hidden = true;
+  positiveSocketStepTitle.hidden = true;
+  positiveSocketPrevButton.hidden = true;
+  positiveSocketNextButton.hidden = true;
+  positiveSocketStepLabel.textContent = '';
   positiveSocketStepTitle.textContent = POSITIVE_SOCKET_STEP_TITLES[positiveSocketStepIndex];
   positiveSocketPrevButton.disabled = positiveSocketStepIndex === POSITIVE_SOCKET_FULL_REMESH_STEP_INDEX;
   positiveSocketNextButton.textContent =
@@ -1904,13 +2636,10 @@ function syncPositiveSocketStepUi(_shouldRefreshPreview = true): void {
         : 'Next';
 
   const state = viewport.getBoundaryWorkflowState();
-  if (modeSelect.value !== 'positive') {
-    positiveSocketNextButton.disabled = false;
-    return;
-  }
-
   positiveSocketNextButton.disabled =
-    positiveSocketStepIndex === POSITIVE_SOCKET_TARGET_STEP_INDEX && !state.hasSelectedBoundary;
+    modeSelect.value === 'positive' &&
+    positiveSocketStepIndex === POSITIVE_SOCKET_TARGET_STEP_INDEX &&
+    !state.hasSelectedBoundary;
 }
 
 function advancePositiveSocketStep(): void {
@@ -2025,6 +2754,7 @@ async function loadSelectedFiles(files: File[]): Promise<void> {
   viewport.setBrushType('smooth');
   viewport.setBrushRadiusMm(radiusPercentToMillimeters(Number(radiusSlider.value)));
   viewport.setBrushStrength(percentToUnit(Number(strengthSlider.value)));
+  viewport.setSmoothOnlyTrimline(trimlineOnlySmooth);
   viewport.setInteractionMode(modeSelect.value as InteractionMode);
   viewport.setSelectionTool(selectionToolSelect.value as SelectionTool);
   viewport.setSelectOnlyVisible(!selectVisibleToggle.checked);
@@ -2076,6 +2806,47 @@ function getExportBaseName(): string {
   const withoutExtension = currentFilename.replace(/\.[^.]+$/, '');
   const sanitized = withoutExtension.replace(/[<>:"/\\|?*\u0000-\u001f]+/g, '_').trim();
   return sanitized || 'NouraSoft_export';
+}
+
+function promptForExportBaseName(): string | null {
+  const requestedName = window.prompt('Export file name', getExportBaseName());
+  if (requestedName === null) {
+    return null;
+  }
+
+  const sanitized = requestedName
+    .replace(/\.[^.]+$/, '')
+    .replace(/[<>:"/\\|?*\u0000-\u001f]+/g, '_')
+    .trim();
+  return sanitized || 'NouraSoft_export';
+}
+
+async function saveExportedBlobFiles(files: Array<{ filename: string; blob: Blob }>): Promise<boolean> {
+  const desktopApi = getNouraDesktopApi();
+  if (desktopApi?.saveExportedFiles) {
+    const payloadFiles = await Promise.all(
+      files.map(async (file) => ({
+        filename: file.filename,
+        mimeType: file.blob.type,
+        data: await file.blob.arrayBuffer(),
+      })),
+    );
+    const result = await desktopApi.saveExportedFiles({ files: payloadFiles });
+    return !result.canceled;
+  }
+
+  for (const file of files) {
+    downloadBlob(file.filename, file.blob);
+  }
+  return true;
+}
+
+function getNouraDesktopApi(): NouraDesktopApi | null {
+  return (window as Window & { nouraDesktop?: NouraDesktopApi }).nouraDesktop ?? null;
+}
+
+function getExportErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message ? error.message : fallback;
 }
 
 function downloadBlob(filename: string, blob: Blob): void {
@@ -2207,10 +2978,10 @@ function configureOperationSliders(boundsRadius: number): void {
 function configureBrushControls(): void {
   radiusSlider.min = '0';
   radiusSlider.max = '100';
-  radiusSlider.step = '0.1';
+  radiusSlider.step = '1';
   radiusInput.min = '0';
   radiusInput.max = '100';
-  radiusInput.step = '0.1';
+  radiusInput.step = '1';
 
   strengthSlider.min = '0';
   strengthSlider.max = '100';
@@ -2226,24 +2997,24 @@ function configureBrushControls(): void {
 function configureSelectionRadiusControls(): void {
   selectionRadiusSlider.min = '0';
   selectionRadiusSlider.max = '100';
-  selectionRadiusSlider.step = '0.1';
+  selectionRadiusSlider.step = '1';
   selectionRadiusInput.min = '0';
   selectionRadiusInput.max = '100';
-  selectionRadiusInput.step = '0.1';
+  selectionRadiusInput.step = '1';
   syncSelectionRadiusFromPercent(clampPercent(Number(selectionRadiusSlider.value), 15));
 }
 
 function syncBrushRadiusFromPercent(value: number): void {
-  const percent = clampPercent(value, DEFAULT_BRUSH_RADIUS_PERCENT);
-  const displayValue = percent.toFixed(1);
+  const percent = clampWholePercent(value, DEFAULT_BRUSH_RADIUS_PERCENT);
+  const displayValue = percent.toFixed(0);
   radiusSlider.value = displayValue;
   radiusInput.value = displayValue;
   viewport.setBrushRadiusMm(radiusPercentToMillimeters(percent));
 }
 
 function syncSelectionRadiusFromPercent(value: number): void {
-  const percent = clampPercent(value, 15);
-  const displayValue = percent.toFixed(1);
+  const percent = clampWholePercent(value, 15);
+  const displayValue = percent.toFixed(0);
   selectionRadiusSlider.value = displayValue;
   selectionRadiusInput.value = displayValue;
   viewport.setSelectionRadiusMm(radiusPercentToMillimeters(percent));
@@ -2268,6 +3039,10 @@ function percentToUnit(percent: number): number {
 function clampPercent(value: number, fallback: number): number {
   const safeValue = Number.isFinite(value) ? value : fallback;
   return Math.min(100, Math.max(0, safeValue));
+}
+
+function clampWholePercent(value: number, fallback: number): number {
+  return Math.round(clampPercent(value, fallback));
 }
 
 function configureAbsoluteSlider(
